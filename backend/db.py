@@ -14,6 +14,7 @@ def _conn():
     return sqlite3.connect(DB_PATH)
 
 
+
 # ========== 初始化 ==========
 def init_db():
     conn = _conn()
@@ -32,7 +33,6 @@ def init_db():
     """)
 
     # --- 字段映射表 field_map ---
-    # 以 (table_name, source_field) 唯一，确保每个源字段只有一条映射记录
     cur.execute("""
     CREATE TABLE IF NOT EXISTS field_map (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +64,6 @@ def init_from_sql():
         """, (tname, "", 0, 0, ""))
     conn.commit()
     conn.close()
-    print("✅ 已初始化 table_map")
 
 
 # ========== 表映射 ==========
@@ -81,6 +80,28 @@ def list_tables(include_disabled=False):
     conn.close()
     if not rows:
         return [(p.stem, "", 0, 0, "") for p in SQL_DIR.glob("*.sql")]
+    return rows
+
+
+def list_mapped_tables() -> List[Dict[str, Any]]:
+    """仅返回已设置 target_entity 且未禁用的表"""
+    init_from_sql()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT source_table, target_entity, priority, disabled, description
+      FROM table_map
+      WHERE disabled=0 AND target_entity <> ''
+      ORDER BY priority DESC, source_table ASC
+    """)
+    rows = [{
+        "source_table": r[0],
+        "target_entity": r[1],
+        "priority": int(r[2]),
+        "disabled": int(r[3]),
+        "description": r[4] or ""
+    } for r in cur.fetchall()]
+    conn.close()
     return rows
 
 
@@ -159,7 +180,7 @@ def get_field_mappings(table_name: str) -> List[Dict[str, Any]]:
 
 
 def delete_field_mapping(table_name: str, source_field: str):
-    """删除指定源字段（按唯一键删除）"""
+    """删除指定源字段"""
     conn = _conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM field_map WHERE table_name=? AND source_field=?", (table_name, source_field))
@@ -168,17 +189,21 @@ def delete_field_mapping(table_name: str, source_field: str):
 
 
 def upsert_field_mapping(table_name: str, source_field: str, target_paths: str, rule: str, enabled: int = 1, order_idx: int = 0):
-    """通用保存（先删后写，避免重复；source_field 唯一）"""
+    """更安全的 upsert，不会无意删除其他字段"""
     conn = _conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM field_map WHERE table_name=? AND source_field=?", (table_name, source_field))
     cur.execute("""
-      INSERT INTO field_map (table_name,source_field,target_paths,rule,enabled,order_idx,last_updated)
-      VALUES (?,?,?,?,?,?,?)
+        INSERT INTO field_map (table_name,source_field,target_paths,rule,enabled,order_idx,last_updated)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(table_name, source_field) DO UPDATE SET
+            target_paths=excluded.target_paths,
+            rule=excluded.rule,
+            enabled=excluded.enabled,
+            order_idx=excluded.order_idx,
+            last_updated=excluded.last_updated
     """, (table_name, source_field or "", target_paths or "", rule or "", int(enabled), int(order_idx), int(time.time())))
     conn.commit()
     conn.close()
-
 
 def update_field_mapping(table_name: str, source_field: str, target_paths: str, rule: str):
     """更新单个字段"""
@@ -195,7 +220,7 @@ def update_field_mapping(table_name: str, source_field: str, target_paths: str, 
 
 
 def update_many_field_mappings(table_name: str, data: List[Dict[str, str]]):
-    """批量更新所有字段；data 每项需包含 source_field, target_paths, rule"""
+    """批量更新所有字段"""
     conn = _conn()
     cur = conn.cursor()
     for m in data:
@@ -224,27 +249,53 @@ def export_all() -> Dict[str, Any]:
 
 
 def import_all(obj: Dict[str, Any]):
+    """安全的全量导入（使用单连接写入，避免嵌套锁）"""
     conn = _conn()
     cur = conn.cursor()
-    conn.execute("BEGIN")
+    conn.execute("BEGIN IMMEDIATE")  # 防止其他写事务进入
     try:
+        # 清空旧配置
         cur.execute("DELETE FROM table_map")
         cur.execute("DELETE FROM field_map")
+
+        # 写 table_map
         for t in obj.get("tables", []):
             cur.execute("""
             INSERT INTO table_map (source_table,target_entity,priority,disabled,description)
             VALUES (?,?,?,?,?)
-            """, (t["source_table"], t.get("target_entity",""), int(t.get("priority",0)),
-                  int(t.get("disabled",0)), t.get("description","")))
+            """, (
+                t["source_table"],
+                t.get("target_entity", ""),
+                int(t.get("priority", 0)),
+                int(t.get("disabled", 0)),
+                t.get("description", "")
+            ))
+
+        # 写 field_map
         for tbl, arr in obj.get("fields", {}).items():
             for f in arr:
-                upsert_field_mapping(tbl, f.get("source_field",""), f.get("target_paths",""), f.get("rule",""))
+                cur.execute("""
+                INSERT INTO field_map (table_name,source_field,target_paths,rule,enabled,order_idx,last_updated)
+                VALUES (?,?,?,?,?,?,?)
+                """, (
+                    tbl,
+                    f.get("source_field", ""),
+                    f.get("target_paths", ""),
+                    f.get("rule", ""),
+                    int(f.get("enabled", 1)),
+                    int(f.get("order_idx", 0)),
+                    int(time.time())
+                ))
+
         conn.commit()
-    except Exception:
+        print("[import_all] 全量导入完成")
+    except Exception as e:
         conn.rollback()
+        print("[import_all error]", e)
         raise
     finally:
         conn.close()
+
 
 
 # ========== 脚本存取 ==========

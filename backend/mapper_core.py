@@ -1,26 +1,27 @@
 # backend/mapper_core.py
 # -*- coding: utf-8 -*-
 from typing import Dict, Any, Tuple, Optional, List
-import re, pymysql, json
+import re, pymysql, json, time
+from pathlib import Path
 
 from backend.db import list_tables, get_priority, get_field_mappings, get_target_entity
+from backend.source_fields import detect_sql_path
 
 try:
-    from version3 import MYSQL_CFG
+    from version3 import MYSQL_CFG, SID
 except Exception:
     MYSQL_CFG = dict(
         host="127.0.0.1", port=3307, user="im", password="root",
         database="im", charset="utf8mb4", autocommit=False
     )
+    SID = "default_sid"
 
 _CACHE = {}
 
-# ================= 基础查询 =================
+# ================= 安全 Entity Fetch =================
 def _entity_fetch(type_name: str, where_field: str, where_val: Any, target_path: str) -> Optional[Any]:
-    """查询 entity 表"""
+    """安全的 entity 查询：未命中返回 None，不复用旧缓存。"""
     key = f"E:{type_name}:{where_field}={where_val}:{target_path}"
-    if key in _CACHE:
-        return _CACHE[key]
     conn = None
     try:
         conn = pymysql.connect(**MYSQL_CFG)
@@ -42,11 +43,17 @@ def _entity_fetch(type_name: str, where_field: str, where_val: Any, target_path:
             if row and row[0]:
                 _CACHE[key] = row[0]
                 return row[0]
+            else:
+                # ❗没查到时，强制清理缓存旧值
+                if key in _CACHE:
+                    del _CACHE[key]
+                return None
     except Exception as e:
         print("[_entity_fetch error]", e)
+        return None
     finally:
-        if conn: conn.close()
-    return None
+        if conn:
+            conn.close()
 
 
 # ================= entity(...) JOIN 模式 =================
@@ -78,7 +85,7 @@ def _eval_entity_join(expr: str, record: Dict[str, Any]) -> Optional[Any]:
     return _entity_fetch(target_tbl, target_field.replace("data.", ""), v, target_path)
 
 
-# ================= 直接按 type+id 取值 =================
+# ================= 直接按 type+id 取值（可选） =================
 def _entity_rel_fetch(type_name: str, entity_id: Any, field: str = "uuid") -> Optional[Any]:
     """entity_rel(ct_company_info,12345)"""
     key = f"REL:{type_name}:{entity_id}:{field}"
@@ -103,49 +110,15 @@ def _entity_rel_fetch(type_name: str, entity_id: Any, field: str = "uuid") -> Op
     return None
 
 
-# ================= 任意表 fetch() =================
-def _fetch_table_value(table: str, key: str, value: Any, field: str) -> Optional[Any]:
-    """fetch(table='ct_city', key='id', value=record.city_id, field='name')"""
-    key_cache = f"F:{table}:{key}={value}:{field}"
-    if key_cache in _CACHE:
-        return _CACHE[key_cache]
-    conn = pymysql.connect(**MYSQL_CFG)
-    try:
-        with conn.cursor() as cur:
-            sql = f"SELECT {field} FROM {table} WHERE {key}=%s LIMIT 1"
-            cur.execute(sql, (value,))
-            row = cur.fetchone()
-            if row and row[0]:
-                _CACHE[key_cache] = row[0]
-                return row[0]
-    except Exception as e:
-        print("[_fetch_table_value error]", e)
-    finally:
-        conn.close()
-    return None
-
-
-# ================= Python 安全求值 =================
-def _safe_eval(expr: str, ctx: dict):
-    """执行安全 Python 表达式"""
-    allowed_builtins = {"str": str, "int": int, "float": float, "len": len, "dict": dict, "list": list}
-    try:
-        return eval(expr, {"__builtins__": allowed_builtins}, ctx)
-    except Exception as e:
-        print("[_safe_eval error]", e)
-        return None
-
-
-# ================= rule 求值 =================
+# ================= Python 安全求值（py:{...}） =================
 FUNC_COALESCE = re.compile(r"coalesce\((.+)\)$", re.I)
 FUNC_CONCAT   = re.compile(r"concat\((.+)\)$", re.I)
-FUNC_PY       = re.compile(r"py:(.+)", re.I)
-FUNC_FETCH    = re.compile(r"fetch\((.+)\)", re.I)
-FUNC_ENTITY_REL = re.compile(r"entity_rel\(([^,]+),([^,\)]+)(?:,([^,\)]+))?\)", re.I)
+PY_RE         = re.compile(r"py:(?P<expr>.+)", re.S)
 ENTITY_SIMPLE_RE = re.compile(r"entity\((?P<typ>\w+)(?:,by=(?P<by>\w+))?(?:,src=(?P<src>\w+))?\)\.(?P<path>[\w\.]+)")
 REL_RE           = re.compile(r"rel\((?P<typ>\w+)(?:,by=(?P<by>\w+))?(?:,src=(?P<src>\w+))?\)$")
 SOURCE_RE        = re.compile(r"source\((?P<table>\w+)\.(?P<field>\w+)=(?P<sexpr>[\w\.]+)\)\.(?P<target>\w+)")
-PY_RE            = re.compile(r"py:(?P<expr>.+)", re.S)
+
+
 def _split_args(s: str) -> List[str]:
     return [a.strip() for a in s.split(",")]
 
@@ -160,7 +133,8 @@ def _eval_atom(atom: str, record: Dict[str, Any]) -> Any:
         return record.get(a[7:], "")
     if a.startswith("entity("):
         v = _eval_entity_join(a, record)
-        if v is not None:
+        # ✅ None 或空字符串都算“没命中”
+        if v not in (None, "null", "NULL"):
             return v
     if a in record:
         return record.get(a)
@@ -168,8 +142,6 @@ def _eval_atom(atom: str, record: Dict[str, Any]) -> Any:
 
 
 def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
-    import datetime
-    import re
     r = (rule or "").strip()
     if not r:
         return None
@@ -188,53 +160,6 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
     if m:
         return "".join(str(_eval_atom(x, record) or "") for x in _split_args(m.group(1)))
 
-    # ✅ date(fmt, expr) 日期格式化函数
-    # 示例: date(%Y-%m-%d, fund_record_time)
-    if r.lower().startswith("date(") and r.endswith(")"):
-        try:
-            inner = r[5:-1].strip()
-            if "," not in inner:
-                return inner  # 参数不足
-            fmt, val_expr = inner.split(",", 1)
-            fmt = fmt.strip()
-            val_expr = val_expr.strip()
-
-            # --- 解析取值 ---
-            v = None
-            if val_expr.startswith("record."):
-                v = record.get(val_expr[7:], "")
-            elif val_expr in record:
-                v = record.get(val_expr)
-            else:
-                try:
-                    v = eval(val_expr, {}, {"record": record})
-                except Exception:
-                    v = val_expr
-
-            if not v:
-                return ""
-
-            s = str(v).strip()
-            # 兼容常见格式 "2024-09-27 13:33:23.391000"
-            try:
-                # 去掉毫秒
-                if "." in s:
-                    s = s.split(".")[0]
-                # 自动补全缺省时间
-                if len(s) == 10:
-                    dt = datetime.datetime.strptime(s, "%Y-%m-%d")
-                else:
-                    dt = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                try:
-                    dt = datetime.datetime.fromisoformat(s)
-                except Exception:
-                    return s
-            return dt.strftime(fmt)
-        except Exception as e:
-            print("[date() parse error]", e)
-            return ""
-
     # entity 简单模式
     m = ENTITY_SIMPLE_RE.fullmatch(r)
     if m:
@@ -251,7 +176,7 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
         if src_val is None: return None
         return _entity_fetch(target_tbl, tfield.replace("data.",""), src_val, target_path)
 
-    # rel(...) 简写
+    # rel(...) 简写 -> 返回 uuid
     m = REL_RE.fullmatch(r)
     if m:
         typ, by, src = m.group("typ"), m.group("by") or "id", m.group("src")
@@ -259,14 +184,14 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
         if src_val is None: return None
         return _entity_fetch(typ, by, src_val, "uuid")
 
-    # source(...) 查询源 SQL 或缓存（留接口实现）
+    # source(...) 预留
     m = SOURCE_RE.fullmatch(r)
     if m:
         table, field, sexpr, target = m.group("table"), m.group("field"), m.group("sexpr"), m.group("target")
         src_val = _eval_atom(sexpr, record)
         return f"[source:{table}.{field}={src_val}->{target}]"
 
-    # ✅ py:{expr} 内嵌 Python（含 .get 多选增强）
+    # py:{...} 支持字典映射 .get() 及任意表达式
     m = PY_RE.match(r)
     if m:
         import ast
@@ -274,10 +199,8 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
 
         expr = m.group("expr").strip()
         rec_obj = SimpleNamespace(**{k: v for k, v in record.items()})
-        safe_globals = {"__builtins__": {}}
-        safe_locals = {"record": rec_obj, **record}
 
-        # --- 支持 py:{...}.get(...,...) ---
+        # 1) 特例：{...}.get(key, default)
         if ".get(" in expr and expr.strip().startswith("{"):
             try:
                 dict_part, _, tail = expr.partition("}.get(")
@@ -288,30 +211,27 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
                 key_expr = args[0]
                 default_val = ast.literal_eval(args[1]) if len(args) > 1 else ""
 
-                def _eval_key(expr: str):
-                    expr = expr.strip()
-                    if expr.startswith("record."):
-                        return record.get(expr[7:], "")
-                    if expr in record:
-                        return record[expr]
+                def _eval_key(_e: str):
+                    _e = _e.strip()
+                    if _e.startswith("record."):
+                        return record.get(_e[7:], "")
+                    if _e in record:
+                        return record[_e]
                     try:
-                        return eval(expr, safe_globals, safe_locals)
+                        return eval(_e, {"__builtins__": {}}, {"record": rec_obj, **record})
                     except Exception:
-                        return expr
+                        return _e
 
-                key_val = _eval_key(key_expr)
-                # ✅ 支持 "1,2,5" → 拼接多个映射
-                if isinstance(key_val, str) and "," in key_val:
-                    parts = [mapping.get(p.strip(), default_val) for p in key_val.split(",")]
-                    return ",".join([str(x) for x in parts if x])
-                return mapping.get(str(key_val), default_val)
+                k = str(_eval_key(key_expr))
+                return mapping.get(k, default_val)
             except Exception as e:
                 print("[py-get parse error]", e)
                 return None
 
-        # --- 常规 py:{...} 表达式 ---
+        # 2) 常规表达式
         try:
-            return eval(expr, safe_globals, safe_locals)
+            val = eval(expr, {"__builtins__": {}}, {"record": rec_obj, **record})
+            return val
         except Exception as e:
             print("[py expr error]", e)
             return None
@@ -322,6 +242,9 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
 
 # ================= 应用映射 =================
 def apply_record_mapping(source_table: str, record: Dict[str, Any], py_script: str = "") -> Tuple[Dict[str, Any], str, str]:
+    # 每次映射前清空 Entity 缓存，避免脏缓存
+    _CACHE.clear()
+
     mappings = get_field_mappings(source_table)
     type_override = get_target_entity(source_table) or ""
     out_name = ""
@@ -332,59 +255,49 @@ def apply_record_mapping(source_table: str, record: Dict[str, Any], py_script: s
             continue
 
         targets = [t.strip() for t in (m["target_paths"] or "").split(",") if t.strip()]
-        rule_raw = (m["rule"] or "").strip()
+        rule = (m["rule"] or "").strip()
         src = m["source_field"] or ""
 
-        # === 支持多 rule（以 || 分隔） ===
-        rule_parts = [r.strip() for r in rule_raw.split("||")] if "||" in rule_raw else [rule_raw]
-        vals = []
+        # ---------- 规则求值 ----------
+        if "||" in rule and len(targets) > 1:
+            # 多规则分发：rule_a || rule_b -> 对应多个 target
+            sub_rules = [x.strip() for x in rule.split("||")]
+            for i, t in enumerate(targets):
+                sel_rule = sub_rules[i] if i < len(sub_rules) else sub_rules[-1]
+                val_i = _eval_rule(sel_rule, new_rec)
 
-        # 分别计算 rule 值
-        for r in rule_parts:
-            v = _eval_rule(r, new_rec)
-            if v is None:
-                v = new_rec.get(src, "")
-            vals.append(v)
+                # ✅ 关键点：只要写了 rule，就不允许回退到 source_field
+                if val_i is None:
+                    val_i = ""   # 不回退到 new_rec.get(src, "")
 
-        # 对齐 rule 与 target 数量
-        if len(vals) == 1 and len(targets) > 1:
-            vals = vals * len(targets)
-        elif len(vals) < len(targets):
-            vals += [vals[-1]] * (len(targets) - len(vals))
+                _assign_target(new_rec, t, val_i, name_holder=lambda v: _set_name(new_rec, v))
+        else:
+            # 单规则或无规则
+            if rule:
+                val = _eval_rule(rule, new_rec)
 
-        # === 一一赋值 ===
-        for i, t in enumerate(targets):
-            val = vals[i]
-            if t == "name":
-                out_name = str(val or "")
-                new_rec["__name__"] = out_name
-            elif t.startswith("data."):
-                path = t[5:].split(".")
-                cur = new_rec
-                for seg in path[:-1]:
-                    cur = cur.setdefault(seg, {})
-                cur[path[-1]] = val
+                # ✅ 关键点：只要写了 rule，就不允许回退到 source_field
+                if val is None:
+                    val = ""    # 不回退
+
             else:
-                new_rec[t] = val
+                # 没写 rule，保持“透传回退”到源字段
+                val = new_rec.get(src, "")
 
-    # 确保 name 存在
+            for t in targets:
+                _assign_target(new_rec, t, val, name_holder=lambda v: _set_name(new_rec, v))
+
     if "__name__" not in new_rec:
-        new_rec["__name__"] = out_name or ""
+        new_rec["__name__"] = out_name or new_rec.get("__name__", "")
 
-    # === 表级脚本执行 ===
-    if py_script.strip():
+    # ---------- 表级脚本 ----------
+    if py_script and py_script.strip():
         try:
             safe_globals = {
                 "__builtins__": {
-                    "len": len,
-                    "str": str,
-                    "int": int,
-                    "float": float,
-                    "dict": dict,
-                    "list": list,
-                    "print": print,
-                    "range": range,
-                    "__import__": __import__,
+                    "len": len, "str": str, "int": int, "float": float,
+                    "dict": dict, "list": list, "print": print,
+                    "range": range, "__import__": __import__,
                 }
             }
             loc = {"record": new_rec}
@@ -393,14 +306,199 @@ def apply_record_mapping(source_table: str, record: Dict[str, Any], py_script: s
         except Exception as e:
             print("[py_script error]", e)
 
-    return new_rec, out_name, type_override
+    return new_rec, new_rec.get("__name__", ""), type_override
 
 
 
+def _set_name(rec: Dict[str, Any], v: Any):
+    rec["__name__"] = str(v or "")
+
+
+def _assign_target(rec: Dict[str, Any], t: str, val: Any, name_holder=None):
+    if t == "name":
+        if name_holder:
+            name_holder(val)
+        else:
+            rec["__name__"] = str(val or "")
+        return
+    if t.startswith("data."):
+        path = t[5:].split(".")
+        cur = rec
+        for seg in path[:-1]:
+            cur = cur.setdefault(seg, {})
+        cur[path[-1]] = val
+        return
+    rec[t] = val
+
+
+# ==================== SQL 解析 & 入库工具 ====================
+INSERT_RE = re.compile(
+    r"insert\s+into\s+public\.\"?(?P<table>[\w\u4e00-\u9fa5]+)\"?\s*\((?P<cols>[^)]*)\)\s*values\s*\((?P<vals>[^)]*)\)\s*;",
+    re.IGNORECASE
+)
+
+def _safe_read_sql(file: Path) -> str:
+    for enc in ("utf-8", "gbk", "utf-8-sig"):
+        try:
+            return file.read_text(encoding=enc)
+        except Exception:
+            continue
+    return file.read_text(encoding="utf-8", errors="ignore")
+
+def _parse_values(raw: str) -> List[Any]:
+    out, buf, in_str = [], [], False
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if in_str:
+            if ch == "'":
+                if i + 1 < len(raw) and raw[i + 1] == "'":
+                    buf.append("'"); i += 2
+                else:
+                    in_str = False; i += 1
+            else:
+                buf.append(ch); i += 1
+        else:
+            if ch == "'": in_str = True; i += 1
+            elif ch == ",": out.append("".join(buf).strip()); buf = []; i += 1
+            else: buf.append(ch); i += 1
+    out.append("".join(buf).strip())
+    def _norm(v):
+        v = v.strip()
+        if v.upper() == "NULL": return ""
+        if v.startswith("'") and v.endswith("'"):
+            return v[1:-1].replace("''","'")
+        return v
+    return [_norm(v) for v in out]
+
+def _parse_sql_file(sql_path: Path) -> List[Dict[str, Any]]:
+    """返回所有 INSERT 记录组成的 dict 列表"""
+    txt = _safe_read_sql(sql_path)
+    entities = []
+    for m in INSERT_RE.finditer(txt):
+        cols = [c.strip().strip('"') for c in m.group("cols").split(",")]
+        vals = _parse_values(m.group("vals"))
+        if len(cols) != len(vals):
+            continue
+        entities.append(dict(zip(cols, vals)))
+    return entities
+
+def _ensure_entity_table(conn):
+    sql = """
+    CREATE TABLE IF NOT EXISTS entity (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        uuid VARCHAR(64) NOT NULL,
+        sid VARCHAR(64) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        type VARCHAR(128) NOT NULL,
+        data JSON NOT NULL,
+        del TINYINT DEFAULT 0,
+        input_date BIGINT DEFAULT 0,
+        update_date BIGINT DEFAULT 0,
+        KEY idx_type (type),
+        KEY idx_sid (sid)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+
+def _make_uuid10() -> str:
+    n = int(time.time() * 1e6)
+    base36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+    s = ""
+    while n:
+        n, r = divmod(n, 36)
+        s = base36[r] + s
+    return (s or "0")[-10:].rjust(10, "0")
+
+def insert_entities(rows: List[Tuple[str,str,str,str,str,int,int,int]]):
+    """rows: (uuid, sid, type, name, data_json, del, input_ts, update_ts)"""
+    if not rows:
+        return 0
+    conn = pymysql.connect(**MYSQL_CFG)
+    try:
+        _ensure_entity_table(conn)
+        sql = """
+          INSERT INTO entity (`uuid`,`sid`,`type`,`name`,`data`,`del`,`input_date`,`update_date`)
+          VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
+        conn.commit()
+        return len(rows)
+    except Exception as e:
+        conn.rollback()
+        print("[insert_entities error]", e)
+        return 0
+    finally:
+        conn.close()
+
+
+# =============== 对外：状态 / 入库 / 删除 ===============
+def check_entity_status(type_name: str) -> int:
+    """返回该 type 在 entity 的记录数"""
+    conn = pymysql.connect(**MYSQL_CFG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM entity WHERE type=%s", (type_name,))
+            n = cur.fetchone()[0]
+            return int(n or 0)
+    except Exception as e:
+        print("[check_entity_status error]", e)
+        return 0
+    finally:
+        conn.close()
+
+def import_table_data(source_table: str, sid: str = None) -> int:
+    """读取 source/sql/<table>.sql 的所有 INSERT，做映射后入库"""
+    sid = sid or SID
+    sql_path = detect_sql_path(source_table)
+    if not sql_path.exists():
+        print(f"[import_table_data] SQL not found: {sql_path}")
+        return 0
+
+    records = _parse_sql_file(sql_path)
+    if not records:
+        print(f"[import_table_data] No INSERT values in {sql_path.name}")
+        return 0
+
+    target_type_default = get_target_entity(source_table) or source_table
+    rows_to_insert = []
+    now_ts = int(time.time())
+
+    for rec in records:
+        mapped_data, out_name, type_override = apply_record_mapping(source_table, rec, py_script="")
+        final_type = type_override or target_type_default
+        data_json = json.dumps(mapped_data, ensure_ascii=False)
+        name_val = out_name or str(mapped_data.get("__name__", "")) or ""
+        rows_to_insert.append((
+            _make_uuid10(), sid, final_type, name_val, data_json, 0, now_ts, now_ts
+        ))
+
+    return insert_entities(rows_to_insert)
+
+def delete_table_data(type_name: str) -> int:
+    """从 entity 物理删除该 type"""
+    conn = pymysql.connect(**MYSQL_CFG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM entity WHERE type=%s", (type_name,))
+            n = int(cur.fetchone()[0] or 0)
+            cur.execute("DELETE FROM entity WHERE type=%s", (type_name,))
+        conn.commit()
+        return n
+    except Exception as e:
+        conn.rollback()
+        print("[delete_table_data error]", e)
+        return 0
+    finally:
+        conn.close()
+
+
+# ==================== 其它工具 ====================
 def get_all_prioritized_tables() -> List[str]:
     rows = list_tables(include_disabled=False)
     return [r[0] for r in rows]
-
 
 def get_table_priority(source_table: str) -> int:
     return get_priority(source_table)
