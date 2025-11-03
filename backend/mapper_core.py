@@ -142,11 +142,62 @@ def _eval_atom(atom: str, record: Dict[str, Any]) -> Any:
 
 
 def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
+    import ast, datetime
+    from types import SimpleNamespace
+
     r = (rule or "").strip()
     if not r:
         return None
 
-    # coalesce(...)
+    # ========== ✅ 新增: date(fmt, field) 或 date(fmt, record.xxx) ==========
+    # 支持两种写法：
+    #   date(%Y-%m-%d, ic_register_date)
+    #   date(%Y-%m-%d, record.fund_record_time)
+    if r.lower().startswith("date(") and "," in r:
+        try:
+            # 提取参数部分
+            inner = r[5:-1]
+            fmt_part, field_part = [x.strip() for x in inner.split(",", 1)]
+            fmt = fmt_part.strip()
+            if fmt.startswith("'") or fmt.startswith('"'):
+                fmt = fmt[1:-1]
+            # 取值
+            if field_part.startswith("record."):
+                val = record.get(field_part[7:], "")
+            else:
+                val = record.get(field_part, "")
+            if not val:
+                return ""
+            # 格式化
+            for f in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    dt = datetime.datetime.strptime(str(val).split(".")[0], f)
+                    return dt.strftime(fmt)
+                except Exception:
+                    continue
+            return str(val).split(" ")[0]
+        except Exception as e:
+            print("[date(fmt, field) error]", e)
+            return ""
+
+    # ========== ✅ 保留: date:%Y-%m-%d 旧写法 ==========
+    if r.startswith("date:"):
+        fmt = r[5:].strip()
+        val = record.get("fund_record_time") or record.get("date") or ""
+        if not val:
+            return ""
+        try:
+            for f in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    dt = datetime.datetime.strptime(str(val).split(".")[0], f)
+                    return dt.strftime(fmt)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return str(val).split(" ")[0]
+
+    # ========== coalesce(...) ==========
     m = FUNC_COALESCE.match(r)
     if m:
         for x in _split_args(m.group(1)):
@@ -155,52 +206,52 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
                 return v
         return ""
 
-    # concat(...)
+    # ========== concat(...) ==========
     m = FUNC_CONCAT.match(r)
     if m:
         return "".join(str(_eval_atom(x, record) or "") for x in _split_args(m.group(1)))
 
-    # entity 简单模式
+    # ========== entity 简单 ==========
     m = ENTITY_SIMPLE_RE.fullmatch(r)
     if m:
         typ, by, src, path = m.group("typ"), m.group("by") or "id", m.group("src"), m.group("path")
         src_val = record.get(src or f"{typ}_id") or record.get("id")
-        if src_val is None: return None
+        if src_val is None:
+            return None
         return _entity_fetch(typ, by, src_val, path)
 
-    # entity join 模式
+    # ========== entity join ==========
     m = ENTITY_JOIN_RE.fullmatch(r)
     if m:
         target_tbl, tfield, sexpr, target_path = m.group("target"), m.group("tfield"), m.group("sexpr"), m.group("path")
         src_val = _eval_atom(sexpr, record)
-        if src_val is None: return None
-        return _entity_fetch(target_tbl, tfield.replace("data.",""), src_val, target_path)
+        if src_val is None:
+            return None
+        return _entity_fetch(target_tbl, tfield.replace("data.", ""), src_val, target_path)
 
-    # rel(...) 简写 -> 返回 uuid
+    # ========== rel(...) ==========
     m = REL_RE.fullmatch(r)
     if m:
         typ, by, src = m.group("typ"), m.group("by") or "id", m.group("src")
         src_val = record.get(src or f"{typ}_id") or record.get("id")
-        if src_val is None: return None
+        if src_val is None:
+            return None
         return _entity_fetch(typ, by, src_val, "uuid")
 
-    # source(...) 预留
+    # ========== source(...) ==========
     m = SOURCE_RE.fullmatch(r)
     if m:
         table, field, sexpr, target = m.group("table"), m.group("field"), m.group("sexpr"), m.group("target")
         src_val = _eval_atom(sexpr, record)
         return f"[source:{table}.{field}={src_val}->{target}]"
 
-    # py:{...} 支持字典映射 .get() 及任意表达式
+    # ========== py:{...} ==========
     m = PY_RE.match(r)
     if m:
-        import ast
-        from types import SimpleNamespace
-
         expr = m.group("expr").strip()
         rec_obj = SimpleNamespace(**{k: v for k, v in record.items()})
 
-        # 1) 特例：{...}.get(key, default)
+        # --- py:{...}.get(...) 字典映射 ---
         if ".get(" in expr and expr.strip().startswith("{"):
             try:
                 dict_part, _, tail = expr.partition("}.get(")
@@ -217,27 +268,33 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
                         return record.get(_e[7:], "")
                     if _e in record:
                         return record[_e]
-                    try:
-                        return eval(_e, {"__builtins__": {}}, {"record": rec_obj, **record})
-                    except Exception:
-                        return _e
+                    return _e
 
-                k = str(_eval_key(key_expr))
-                return mapping.get(k, default_val)
+                raw_val = _eval_key(key_expr)
+                if isinstance(raw_val, str) and "," in raw_val:
+                    parts = [p.strip() for p in raw_val.split(",") if p.strip()]
+                    mapped = [mapping.get(p, default_val) for p in parts]
+                    return ",".join(mapped)
+                return mapping.get(str(raw_val), default_val)
             except Exception as e:
                 print("[py-get parse error]", e)
                 return None
 
-        # 2) 常规表达式
+        # --- 常规 py 表达式 ---
         try:
-            val = eval(expr, {"__builtins__": {}}, {"record": rec_obj, **record})
+            safe_globals = {
+                "__builtins__": {"str": str, "int": int, "float": float, "len": len,
+                                 "round": round, "dict": dict, "list": list, "abs": abs}
+            }
+            val = eval(expr, safe_globals, {"record": rec_obj, **record})
             return val
         except Exception as e:
             print("[py expr error]", e)
             return None
 
-    # 默认 atom
+    # ========== 默认 ==========
     return _eval_atom(r, record)
+
 
 
 # ================= 应用映射 =================
