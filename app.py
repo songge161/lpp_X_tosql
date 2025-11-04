@@ -258,14 +258,22 @@ def render_table_detail(table_name: str):
         st.code(json.dumps(sample, ensure_ascii=False, indent=2))
 
     if st.button("生成模拟打印"):
+        from backend.mapper_core import _extract_entity_meta
         py_now = get_table_script(table_name) or ""
         data_rec, out_name, type_override = apply_record_mapping(table_name, sample, py_now)
+
+        # ⬇️ 抽 meta 并从 data_rec 中剔除
+        meta = _extract_entity_meta(data_rec)
+
         preview = {
             "uuid": "(mock uuid)",
             "sid": SID,
-            "type": type_override or get_target_entity(table_name) or table_name,
+            "type": type_override or table_name,
             "name": out_name or "",
-            "data": data_rec
+            "del": int(meta["del"]),  # 顶层
+            "input_date": int(meta["input_date"]),  # 顶层
+            "update_date": int(meta["update_date"]),  # 顶层
+            "data": data_rec  # 不再含 del/input_date/update_date
         }
         st.success("生成成功：")
         st.code(json.dumps(preview, ensure_ascii=False, indent=2))

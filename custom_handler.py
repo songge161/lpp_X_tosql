@@ -145,33 +145,34 @@ def ct_investor_fund_base(record: Dict[str, Any]) -> Dict[str, Any]:
     record = resolve_relation(record, "fund_name", "ct_fund_base_info", "fund_id", "fund_name")
     return record
 
-def ct_fund_firm_mid(record: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    处理 ct_fund_firm_mid（基金-机构中间表）：
-    - fund_id -> 基金 uuid 写入 _rel（内部+外部）
-    - firm_id -> 补充 firm_name_label / firm_name / firm_name_optgroup
-    """
-    fund_id = record.get("fund_id")
-    firm_id = record.get("firm_id")
-    # ---------- fund 关系 ----------
-    fund_uuid = fetch_field_uuid("ct_fund_base_info", "id", fund_id)
-    if fund_uuid:
-        # ✅ 写入 data 内部（record）
-        record["_rel"] = fund_uuid
-    # ---------- firm 关系 ----------
-    if firm_id:
-        record = resolve_relation(
-            record,
-            "firm_name",          # 前缀
-            "ct_fund_manage_firm",# 目标表
-            "firm_id",            # 当前键
-            "firm_name"           # 目标字段
-        )
-    return record
-def ct_fund_manage_firm(record):
-    record["__name__"] = record.get("firm_name", "")
-def ct_fund_base_info(record):
-    record["__name__"] = record.get("fund_name", "")
+# def ct_fund_firm_mid(record: Dict[str, Any]) -> Dict[str, Any]:
+#     """
+#     处理 ct_fund_firm_mid（基金-机构中间表）：
+#     - fund_id -> 基金 uuid 写入 _rel（内部+外部）
+#     - firm_id -> 补充 firm_name_label / firm_name / firm_name_optgroup
+#     """
+#     fund_id = record.get("fund_id")
+#     firm_id = record.get("firm_id")
+#     # ---------- fund 关系 ----------
+#     fund_uuid = fetch_field_uuid("ct_fund_base_info", "id", fund_id)
+#     if fund_uuid:
+#         # ✅ 写入 data 内部（record）
+#         record["_rel"] = fund_uuid
+#     # ---------- firm 关系 ----------
+#     if firm_id:
+#         record = resolve_relation(
+#             record,
+#             "firm_name",          # 前缀
+#             "ct_fund_manage_firm",# 目标表
+#             "firm_id",            # 当前键
+#             "firm_name"           # 目标字段
+#         )
+#     return record
+# def ct_fund_manage_firm(record):
+#     record["__name__"] = record.get("firm_name", "")
+# def ct_fund_base_info(record):
+#     record["__name__"] = record.get("fund_name", "")
+
 def default(record: Dict[str, Any], table: str) -> Dict[str, Any]:
     """默认逻辑（全表通用清洗）"""
     for k, v in record.items():

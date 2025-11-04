@@ -1,9 +1,9 @@
 # backend/mapper_core.py
 # -*- coding: utf-8 -*-
 from typing import Dict, Any, Tuple, Optional, List
-import re, pymysql, json, time
+import re, pymysql, json, time,math, datetime
 from pathlib import Path
-
+from types import SimpleNamespace
 from backend.db import list_tables, get_priority, get_field_mappings, get_target_entity
 from backend.source_fields import detect_sql_path
 
@@ -16,8 +16,114 @@ except Exception:
     )
     SID = "default_sid"
 
-_CACHE = {}
+class SafeRecord(SimpleNamespace):
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
+_CACHE: Dict[str, Any] = {}
+
+COMPLEX_EXPR_RE = re.compile(
+    r"(?P<etype>(entity|sql))\.(?P<table>\w+)\(\s*(?P<cond>.+?)\s*\)\.(?P<target>[\w\.]+)",
+    re.S
+)
+
+def _eval_complex_expr(expr: str, record: Dict[str, Any]) -> Optional[Any]:
+    expr = re.sub(r"\s+", " ", expr.strip())
+    m = COMPLEX_EXPR_RE.fullmatch(expr)
+    if not m:
+        return None
+
+    etype, table, cond, target = (
+        m.group("etype"), m.group("table"), m.group("cond"), m.group("target")
+    )
+
+    if "=" not in cond:
+        return None
+    left, right = [x.strip() for x in cond.split("=", 1)]
+
+    # 递归右值
+    if right.startswith(("entity.", "sql.")):
+        right_val = _eval_complex_expr(right, record)
+    else:
+        right_val = _eval_rule(right, record)
+
+    if right_val in (None, "", "null", "NULL"):
+        return None
+
+    where_field = left.split(".")[-1].replace("data.", "")
+    # ✅ 无论是 entity 还是 sql，都统一使用 entity_fetch
+    return _entity_fetch(table, where_field, right_val, target)
+# ==================== 🔧 SQL 直接查询补丁 ====================
+
+SQL_COMPLEX_RE = re.compile(
+    r"sql\.(?P<table>\w+)\(\s*sql\.(?P<table2>\w+)\.(?P<where_field>[\w\.]+)\s*=\s*(?P<sexpr>[^)]+)\s*\)\.(?P<target>[\w\.]+)",
+    re.S
+)
+
+def _eval_sql_complex_expr(expr: str, record: Dict[str, Any]) -> Optional[Any]:
+    """
+    支持类似：
+        sql.import_fund_info(sql.import_fund_info.fund_id=record.id).department
+    的结构，直接从源 SQL 文件中查字段。
+    """
+    m = SQL_COMPLEX_RE.fullmatch(expr.strip())
+    if not m:
+        return None
+
+    table = m.group("table")
+    where_field = m.group("where_field").replace("data.", "")
+    src_expr = m.group("sexpr").strip()
+    target_field = m.group("target")
+
+    # 计算右值
+    v = None
+    if src_expr.startswith("record."):
+        v = record.get(src_expr[7:], "")
+    elif src_expr in record:
+        v = record.get(src_expr, "")
+    else:
+        try:
+            from types import SimpleNamespace
+            rec_obj = SafeRecord(**{k: v for k, v in record.items()})
+            v = eval(src_expr, {"__builtins__": {}}, {"record": rec_obj, **record})
+        except Exception:
+            v = src_expr
+    if not v:
+        return ""
+
+    # 直接查 SQL
+    try:
+        return _sql_lookup(table, where_field, v, target_field) or ""
+    except Exception as e:
+        print("[_eval_sql_complex_expr error]", e)
+        return ""
+
+def __date_ts__(v) -> int:
+    """
+    通用时间转秒级时间戳：
+      - 支持字符串（含毫秒）: "2025-08-13 12:49:06.688000"
+      - 支持纯日期: "2025-08-13"
+      - 支持数字(秒/毫秒): 1699911111000 或 1699911111
+      - 为空返回当前时间戳
+    """
+    import datetime, time
+    if not v:
+        return int(time.time())
+    if isinstance(v, (int, float)):
+        # 毫秒 -> 秒
+        return int(v // 1000 if v > 1e12 else v)
+    if isinstance(v, str):
+        s = v.strip()
+        # 尝试多种时间格式
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return int(datetime.datetime.strptime(s.split(".")[0], fmt).timestamp())
+            except Exception:
+                continue
+        # 纯数字字符串
+        if s.isdigit():
+            return int(int(s) // 1000 if int(s) > 1e12 else int(s))
+    return int(time.time())
 # ================= 安全 Entity Fetch =================
 def _entity_fetch(type_name: str, where_field: str, where_val: Any, target_path: str) -> Optional[Any]:
     """安全的 entity 查询：未命中返回 None，不复用旧缓存。"""
@@ -58,20 +164,40 @@ def _entity_fetch(type_name: str, where_field: str, where_val: Any, target_path:
 
 # ================= entity(...) JOIN 模式 =================
 ENTITY_JOIN_RE = re.compile(
-    r"entity\((?P<target>\w+):(?P<tfield>[\w\.]+)=(?P<sexpr>[\w\.]+)\)\.(?P<path>[\w\.]+)"
+    r"entity\("
+    r"(?P<target>\w+):"
+    r"(?P<tfield>[\w\.]+)="
+    r"(?P<sexpr>"                  # 右值支持两类：
+    r"entity\([^)]*\)\.[\w\.]+"    #   a) entity(...).path
+    r"|[\w\.]+"                    #   b) record 字段或 a.b.c 链
+    r")\)"
+    r"\.(?P<path>[\w\.]+)"
 )
 
 def _eval_entity_join(expr: str, record: Dict[str, Any]) -> Optional[Any]:
-    """支持 entity(ct_fund_firm_mid:data.fund_id=ct_fund_base_info.data.id).uuid"""
     m = ENTITY_JOIN_RE.fullmatch(expr.strip())
     if not m:
         return None
-    target_tbl = m.group("target")
-    target_field = m.group("tfield")
-    source_expr = m.group("sexpr")
-    target_path = m.group("path")
 
-    # 获取右值
+    target_tbl  = m.group("target")
+    target_field = m.group("tfield")            # 例如 data.id
+    source_expr = m.group("sexpr")              # 可能是 "record.xxx" / "id" / "entity(...).yyy"
+    target_path = m.group("path")               # 例如 uuid / data.xxx
+
+    # 1) 右值如果是内层 entity(...) 表达式，先递归求值
+    if source_expr.strip().startswith("entity("):
+        # 直接复用 rule 求值引擎，拿到实际右值
+        inner_val = _eval_rule(source_expr, record)
+        if inner_val in (None, "", "null", "NULL"):
+            return None
+        return _entity_fetch(
+            target_tbl,
+            target_field.replace("data.", ""),
+            inner_val,
+            target_path
+        )
+
+    # 2) 否则按原先逻辑：从 record 里取右值（支持 record.xxx 或 a.b.c 链）
     parts = source_expr.split(".")
     v = record
     for seg in parts:
@@ -82,7 +208,13 @@ def _eval_entity_join(expr: str, record: Dict[str, Any]) -> Optional[Any]:
             break
     if v is None:
         return None
-    return _entity_fetch(target_tbl, target_field.replace("data.", ""), v, target_path)
+
+    return _entity_fetch(
+        target_tbl,
+        target_field.replace("data.", ""),
+        v,
+        target_path
+    )
 
 
 # ================= 直接按 type+id 取值（可选） =================
@@ -121,6 +253,8 @@ SOURCE_RE        = re.compile(r"source\((?P<table>\w+)\.(?P<field>\w+)=(?P<sexpr
 
 def _split_args(s: str) -> List[str]:
     return [a.strip() for a in s.split(",")]
+# ========== 时间戳辅助 ==========
+
 
 
 def _eval_atom(atom: str, record: Dict[str, Any]) -> Any:
@@ -148,7 +282,14 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
     r = (rule or "").strip()
     if not r:
         return None
-
+    # --- 优先检测 entity/sql 嵌套表达式 ---
+    m = COMPLEX_EXPR_RE.fullmatch(r)
+    if m:
+        return _eval_complex_expr(r, record)
+    # ✅ 支持 sql.xxx(...) 顶层结构
+    m = SQL_COMPLEX_RE.fullmatch(r)
+    if m:
+        return _eval_sql_complex_expr(r, record)
     # ========== ✅ 新增: date(fmt, field) 或 date(fmt, record.xxx) ==========
     # 支持两种写法：
     #   date(%Y-%m-%d, ic_register_date)
@@ -196,7 +337,6 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
         except Exception:
             pass
         return str(val).split(" ")[0]
-
     # ========== coalesce(...) ==========
     m = FUNC_COALESCE.match(r)
     if m:
@@ -249,8 +389,7 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
     m = PY_RE.match(r)
     if m:
         expr = m.group("expr").strip()
-        rec_obj = SimpleNamespace(**{k: v for k, v in record.items()})
-
+        rec_obj = SafeRecord(**{k: v for k, v in record.items()})
         # --- py:{...}.get(...) 字典映射 ---
         if ".get(" in expr and expr.strip().startswith("{"):
             try:
@@ -283,8 +422,13 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
         # --- 常规 py 表达式 ---
         try:
             safe_globals = {
-                "__builtins__": {"str": str, "int": int, "float": float, "len": len,
-                                 "round": round, "dict": dict, "list": list, "abs": abs}
+                "__builtins__": {
+                    "str": str, "int": int, "float": float, "len": len, "round": round,
+                    "dict": dict, "list": list, "__date_ts__": __date_ts__,
+                },
+                "re": re,
+                "json": json,
+                "__date_ts__": __date_ts__
             }
             val = eval(expr, safe_globals, {"record": rec_obj, **record})
             return val
@@ -522,14 +666,25 @@ def import_table_data(source_table: str, sid: str = None) -> int:
     target_type_default = get_target_entity(source_table) or source_table
     rows_to_insert = []
     now_ts = int(time.time())
-
     for rec in records:
         mapped_data, out_name, type_override = apply_record_mapping(source_table, rec, py_script="")
         final_type = type_override or target_type_default
-        data_json = json.dumps(mapped_data, ensure_ascii=False)
+
+        # ⬇️ 把 del/input_date/update_date 从 mapped_data 中抽到顶层（并从 data 中剔除）
+        meta = _extract_entity_meta(mapped_data, now_ts=now_ts)
+
+        data_json = json.dumps(mapped_data, ensure_ascii=False)  # 现在的 mapped_data 已不含 del/input_date/update_date
         name_val = out_name or str(mapped_data.get("__name__", "")) or ""
+
         rows_to_insert.append((
-            _make_uuid10(), sid, final_type, name_val, data_json, 0, now_ts, now_ts
+            _make_uuid10(),  # uuid
+            sid,  # sid
+            final_type,  # type
+            name_val,  # name
+            data_json,  # data
+            int(meta["del"]),  # del (TOP)
+            int(meta["input_date"]),  # input_date (TOP)
+            int(meta["update_date"])  # update_date (TOP)
         ))
 
     return insert_entities(rows_to_insert)
@@ -559,3 +714,36 @@ def get_all_prioritized_tables() -> List[str]:
 
 def get_table_priority(source_table: str) -> int:
     return get_priority(source_table)
+def _extract_entity_meta(mapped: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """
+    从映射完的 new_rec 中抽出需要放到 entity 顶层的元字段：
+      - del               -> 顶层 del (int)
+      - input_date        -> 顶层 input_date (bigint 秒/毫秒都可，你这里用秒)
+      - update_date       -> 顶层 update_date (bigint)
+    抽出后会从 mapped 中移除这些键，以保证 data 里不再包含它们。
+    """
+    meta = {}
+    if "del" in mapped:
+        try:
+            meta["del"] = int(mapped.pop("del"))
+        except Exception:
+            meta["del"] = 0
+    if "input_date" in mapped:
+        try:
+            meta["input_date"] = int(mapped.pop("input_date"))
+        except Exception:
+            meta["input_date"] = int(now_ts or time.time())
+    if "update_date" in mapped:
+        try:
+            meta["update_date"] = int(mapped.pop("update_date"))
+        except Exception:
+            meta["update_date"] = int(now_ts or time.time())
+
+    # 默认兜底
+    if "del" not in meta:
+        meta["del"] = 0
+    if "input_date" not in meta:
+        meta["input_date"] = int(now_ts or time.time())
+    if "update_date" not in meta:
+        meta["update_date"] = int(now_ts or time.time())
+    return meta
