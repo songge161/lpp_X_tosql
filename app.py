@@ -12,7 +12,7 @@ from backend.db import (
     delete_field_mapping, get_table_script, save_table_script,
     export_all, import_all
 )
-from backend.source_fields import detect_source_fields, detect_sql_path
+from backend.source_fields import detect_source_fields, detect_sql_path,detect_field_comments, detect_table_title
 from backend.mapper_core import apply_record_mapping, check_entity_status, import_table_data, delete_table_data
 
 try:
@@ -25,6 +25,7 @@ init_db()
 
 
 # ================= 工具函数 =================
+
 def _ensure_all_fields_seeded(table_name: str):
     """
     仅在首次访问某表时执行一次字段初始化。
@@ -118,6 +119,7 @@ def _guess_table_display_name(table_name: str) -> str:
 
 # ================= 详情页（原有） =================
 def render_table_detail(table_name: str):
+    comment_map = detect_field_comments(table_name)
     st.title(f"表配置：{table_name}")
     _ensure_all_fields_seeded(table_name)
 
@@ -178,7 +180,9 @@ def render_table_detail(table_name: str):
 
         cols = st.columns([2, 3, 4, 1, 1, 1])
         with cols[0]:
-            st.text(sfield or "(自定义)")
+            label = sfield or "(自定义)"
+            note = comment_map.get(sfield, "")
+            st.text(f"{label}{f'（{note}）' if note else ''}")
 
         new_tpath = cols[1].text_input(label="", value=m["target_paths"], key=t_key, placeholder="target_paths")
         new_rule  = cols[2].text_input(label="", value=m["rule"],         key=r_key, placeholder="rule")

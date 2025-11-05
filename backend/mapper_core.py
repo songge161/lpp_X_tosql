@@ -633,7 +633,130 @@ def insert_entities(rows: List[Tuple[str,str,str,str,str,int,int,int]]):
         return 0
     finally:
         conn.close()
+# ========== NEW: 解析 type(key) ==========
+def _parse_type_and_key(type_spec: str) -> Tuple[str, str]:
+    """
+    把 'fund(id)' 解析为 ('fund', 'id')；若无 () 则默认 key='id'
+    """
+    s = (type_spec or "").strip()
+    if "(" in s and s.endswith(")"):
+        t, k = s.split("(", 1)
+        return t.strip(), k[:-1].strip() or "id"
+    return s, "id"
 
+
+# ========== NEW: 抽取顶层 meta（并从 data JSON 中剔除这些 meta）==========
+def _extract_entity_meta(mapped: Dict[str, Any], now_ts: int) -> Dict[str, int]:
+    """
+    将 del / input_date / update_date 作为 entity 顶层列使用；
+    若不存在，使用默认值；从 mapped 中移除这些键，避免进入 data JSON。
+    """
+    meta = {
+        "del": int(mapped.pop("del", 0) or 0),
+        "input_date": int(mapped.pop("input_date", now_ts) or now_ts),
+        "update_date": int(mapped.pop("update_date", now_ts) or now_ts),
+    }
+    return meta
+
+
+# ========== NEW: 单条 UPSERT 到 entity ==========
+def _upsert_entity_row(type_name: str, key_field: str, key_value: Any,
+                       sid: str, name_val: str, data_json: str,
+                       meta: Dict[str, int]) -> int:
+    """
+    使用 (type_name, JSON_EXTRACT(data, $.<key_field>)=key_value) 实现 UPSERT。
+    命中则 UPDATE：name、data、update_date；未命中则 INSERT。
+    返回 1 表示成功写入（无论插入还是更新）。
+    """
+    if key_value in (None, ""):
+        # 没有唯一键值，不写
+        return 0
+
+    conn = pymysql.connect(**MYSQL_CFG)
+    try:
+        with conn.cursor() as cur:
+            # 查询是否已存在该唯一键
+            sel_sql = """
+                SELECT uuid FROM entity
+                WHERE type=%s AND JSON_UNQUOTE(JSON_EXTRACT(data, %s))=%s
+                LIMIT 1
+            """
+            cur.execute(sel_sql, (type_name, f"$.{key_field}", str(key_value)))
+            row = cur.fetchone()
+
+            if row:  # 命中 → UPDATE
+                uuid = row[0]
+                upd_sql = """
+                    UPDATE entity
+                    SET name=%s,
+                        data=%s,
+                        `del`=%s,
+                        update_date=%s
+                    WHERE uuid=%s
+                """
+                cur.execute(
+                    upd_sql,
+                    (name_val, data_json, int(meta["del"]), int(meta["update_date"]), uuid)
+                )
+            else:    # 未命中 → INSERT
+                ins_sql = """
+                    INSERT INTO entity
+                        (`uuid`,`sid`,`type`,`name`,`data`,`del`,`input_date`,`update_date`)
+                    VALUES
+                        (%s,%s,%s,%s,%s,%s,%s,%s)
+                """
+                cur.execute(
+                    ins_sql,
+                    (_make_uuid10(), sid, type_name, name_val, data_json,
+                     int(meta["del"]), int(meta["input_date"]), int(meta["update_date"]))
+                )
+
+        conn.commit()
+        return 1
+    except Exception as e:
+        conn.rollback()
+        print("[_upsert_entity_row error]", e)
+        return 0
+    finally:
+        conn.close()
+
+def upsert_entity(type_name: str, key_field: str, key_value: Any, name: str, data_json: str):
+    conn = pymysql.connect(**MYSQL_CFG)
+    try:
+        with conn.cursor() as cur:
+            # 1) 查是否已存在同一 fund
+            sql_sel = """
+                SELECT uuid FROM entity
+                WHERE type=%s AND JSON_UNQUOTE(JSON_EXTRACT(data, %s))=%s LIMIT 1
+            """
+            cur.execute(sql_sel, (type_name, f"$.{key_field}", key_value))
+            row = cur.fetchone()
+
+            now_ts = int(time.time())
+            if row:  # 存在 → UPDATE
+                uuid = row[0]
+                sql_upd = """
+                    UPDATE entity
+                    SET name=%s, data=%s, update_date=%s
+                    WHERE uuid=%s
+                """
+                cur.execute(sql_upd, (name, data_json, now_ts, uuid))
+            else:   # 不存在 → INSERT
+                uuid = _make_uuid10()
+                sql_ins = """
+                    INSERT INTO entity(uuid, sid, type, name, data, del, input_date, update_date)
+                    VALUES (%s,%s,%s,%s,%s,0,%s,%s)
+                """
+                cur.execute(sql_ins, (uuid, SID, type_name, name, data_json, now_ts, now_ts))
+
+        conn.commit()
+        return 1
+    except Exception as e:
+        conn.rollback()
+        print("[upsert_entity error]", e)
+        return 0
+    finally:
+        conn.close()
 
 # =============== 对外：状态 / 入库 / 删除 ===============
 def check_entity_status(type_name: str) -> int:
@@ -651,7 +774,13 @@ def check_entity_status(type_name: str) -> int:
         conn.close()
 
 def import_table_data(source_table: str, sid: str = None) -> int:
-    """读取 source/sql/<table>.sql 的所有 INSERT，做映射后入库"""
+    """
+    读取 source/sql/<table>.sql 的所有 INSERT，映射后按 (type(key)) 规则 UPSERT 入库。
+    - target_entity 支持 'fund' 或 'fund(id)'；后者表示统一主键是 data.id。
+    - 若未配置 ()，默认 key_field='id'。
+    - 确保该 key_field 写入到 data JSON（即 mapped_data[key_field] 存在）。
+    - del/input_date/update_date 抽到 entity 顶层（不进 data JSON）。
+    """
     sid = sid or SID
     sql_path = detect_sql_path(source_table)
     if not sql_path.exists():
@@ -663,31 +792,48 @@ def import_table_data(source_table: str, sid: str = None) -> int:
         print(f"[import_table_data] No INSERT values in {sql_path.name}")
         return 0
 
-    target_type_default = get_target_entity(source_table) or source_table
-    rows_to_insert = []
-    now_ts = int(time.time())
-    for rec in records:
-        mapped_data, out_name, type_override = apply_record_mapping(source_table, rec, py_script="")
-        final_type = type_override or target_type_default
+    # ⭐ 支持 'fund(id)' 语法
+    target_type_spec = get_target_entity(source_table) or source_table
+    final_type, key_field = _parse_type_and_key(target_type_spec)
 
-        # ⬇️ 把 del/input_date/update_date 从 mapped_data 中抽到顶层（并从 data 中剔除）
+    now_ts = int(time.time())
+    wrote = 0
+
+    for rec in records:
+        # 1) 映射（页面脚本、rule 已在 apply_record_mapping 内处理）
+        mapped_data, out_name, type_override = apply_record_mapping(source_table, rec, py_script="")
+        type_here = (type_override or final_type).strip() or source_table
+
+        # 2) 统一键值：优先 mapped_data，其次原始 rec
+        key_val = mapped_data.get(key_field, None)
+        if key_val in (None, ""):
+            key_val = rec.get(key_field, "")
+
+        # 3) 确保该统一键被写入 data JSON
+        if key_field not in mapped_data:
+            mapped_data[key_field] = key_val
+
+        # 4) 元字段抽取（并从 data JSON 剔除）
         meta = _extract_entity_meta(mapped_data, now_ts=now_ts)
 
-        data_json = json.dumps(mapped_data, ensure_ascii=False)  # 现在的 mapped_data 已不含 del/input_date/update_date
-        name_val = out_name or str(mapped_data.get("__name__", "")) or ""
+        # 5) name 取 mapped_data['__name__'] 回落 out_name
+        name_val = (mapped_data.get("__name__") or out_name or "").strip()
 
-        rows_to_insert.append((
-            _make_uuid10(),  # uuid
-            sid,  # sid
-            final_type,  # type
-            name_val,  # name
-            data_json,  # data
-            int(meta["del"]),  # del (TOP)
-            int(meta["input_date"]),  # input_date (TOP)
-            int(meta["update_date"])  # update_date (TOP)
-        ))
+        # 6) 序列化 data（此时已不包含 del/input_date/update_date）
+        data_json = json.dumps(mapped_data, ensure_ascii=False)
 
-    return insert_entities(rows_to_insert)
+        # 7) UPSERT
+        wrote += _upsert_entity_row(
+            type_name=type_here,
+            key_field=key_field,
+            key_value=key_val,
+            sid=sid,
+            name_val=name_val,
+            data_json=data_json,
+            meta=meta
+        )
+
+    return wrote
 
 def delete_table_data(type_name: str) -> int:
     """从 entity 物理删除该 type"""
