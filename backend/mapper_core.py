@@ -442,12 +442,13 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
 
 
 # ================= 应用映射 =================
-def apply_record_mapping(source_table: str, record: Dict[str, Any], py_script: str = "") -> Tuple[Dict[str, Any], str, str]:
+def apply_record_mapping(source_table: str, record: Dict[str, Any], py_script: str = "", target_entity: Optional[str] = None) -> Tuple[Dict[str, Any], str, str]:
     # 每次映射前清空 Entity 缓存，避免脏缓存
     _CACHE.clear()
 
-    mappings = get_field_mappings(source_table)
-    type_override = get_target_entity(source_table) or ""
+    # 按当前 entity 过滤字段映射；未指定则使用表默认
+    mappings = get_field_mappings(source_table, target_entity or None)
+    type_override = (target_entity or get_target_entity(source_table) or "")
     out_name = ""
     new_rec = dict(record)
 
@@ -501,7 +502,13 @@ def apply_record_mapping(source_table: str, record: Dict[str, Any], py_script: s
                     "range": range, "__import__": __import__,
                 }
             }
-            loc = {"record": new_rec}
+            # 注入当前 entity 上下文，脚本可读 current_entity / type_name
+            loc = {
+                "record": new_rec,
+                "current_entity": (target_entity or ""),
+                "target_entity": (target_entity or ""),
+                "type_name": (target_entity or get_target_entity(source_table) or source_table)
+            }
             exec(py_script, safe_globals, loc)
             new_rec = loc["record"]
         except Exception as e:
@@ -773,7 +780,7 @@ def check_entity_status(type_name: str) -> int:
     finally:
         conn.close()
 
-def import_table_data(source_table: str, sid: str = None) -> int:
+def import_table_data(source_table: str, sid: str = None, target_entity_spec: Optional[str] = None) -> int:
     """
     读取 source/sql/<table>.sql 的所有 INSERT，映射后按 (type(key)) 规则 UPSERT 入库。
     - target_entity 支持 'fund' 或 'fund(id)'；后者表示统一主键是 data.id。
@@ -792,16 +799,18 @@ def import_table_data(source_table: str, sid: str = None) -> int:
         print(f"[import_table_data] No INSERT values in {sql_path.name}")
         return 0
 
-    # ⭐ 支持 'fund(id)' 语法
-    target_type_spec = get_target_entity(source_table) or source_table
+    # ⭐ 支持外部指定目标类型（如 'fund' 或 'fund(id)'）
+    target_type_spec = (target_entity_spec or get_target_entity(source_table) or source_table)
     final_type, key_field = _parse_type_and_key(target_type_spec)
 
     now_ts = int(time.time())
     wrote = 0
 
     for rec in records:
-        # 1) 映射（页面脚本、rule 已在 apply_record_mapping 内处理）
-        mapped_data, out_name, type_override = apply_record_mapping(source_table, rec, py_script="")
+        # 1) 映射：按当前 final_type 过滤字段映射 & 脚本上下文
+        mapped_data, out_name, type_override = apply_record_mapping(
+            source_table, rec, py_script="", target_entity=final_type
+        )
         type_here = (type_override or final_type).strip() or source_table
 
         # 2) 统一键值：优先 mapped_data，其次原始 rec
@@ -851,6 +860,8 @@ def delete_table_data(type_name: str) -> int:
         return 0
     finally:
         conn.close()
+
+
 
 
 # ==================== 其它工具 ====================

@@ -5,12 +5,14 @@ import re
 from pathlib import Path
 import streamlit as st
 
+# 顶部 import 部分
 from backend.db import (
     init_db, list_tables, list_mapped_tables, save_table_mapping, soft_delete_table,
     restore_table, get_target_entity, get_priority,
     get_field_mappings, upsert_field_mapping, update_field_mapping, update_many_field_mappings,
     delete_field_mapping, get_table_script, save_table_script,
-    export_all, import_all
+    export_all, import_all,
+    rename_table_target_entity  # 新增：原子重命名
 )
 from backend.source_fields import detect_source_fields, detect_sql_path,detect_field_comments, detect_table_title
 from backend.mapper_core import apply_record_mapping, check_entity_status, import_table_data, delete_table_data
@@ -26,31 +28,29 @@ init_db()
 
 # ================= 工具函数 =================
 
-def _ensure_all_fields_seeded(table_name: str):
+# function _ensure_all_fields_seeded(table_name: str, target_entity: str)
+def _ensure_all_fields_seeded(table_name: str, target_entity: str):
     """
-    仅在首次访问某表时执行一次字段初始化。
-    - 已存在映射的字段不会被覆盖。
-    - 避免页面刷新重复写入导致原配置丢失。
+    仅在首次访问某表-实体组合时执行一次字段初始化。
+    - 按 (table_name, target_entity) 维度初始化
+    - 已存在映射的字段不会被覆盖
     """
-    cache_key = f"seeded_{table_name}"
-
-    # ✅ 如果本次运行中已经初始化过，直接返回
+    cache_key = f"seeded_{table_name}_{target_entity or ''}"
     if st.session_state.get(cache_key):
         return
 
-    # ✅ 从数据库加载已有映射（防止覆盖）
-    existing_mappings = get_field_mappings(table_name)
+    # 按当前实体读取已存在的字段映射
+    existing_mappings = get_field_mappings(table_name, target_entity or None)
     existing_fields = {m["source_field"] for m in existing_mappings}
 
-    # ✅ 检测源 SQL 的字段
+    # 从源 SQL 检测字段
     src_fields = detect_source_fields(table_name)
 
-    # ✅ 仅对数据库中不存在的字段进行初始化
+    # 仅为该实体缺失的字段做 upsert，target_paths 默认 data.<同名>
     for f in src_fields:
         if f not in existing_fields:
-            upsert_field_mapping(table_name, f, f"data.{f}", "", 1, 0)
+            upsert_field_mapping(table_name, f, f"data.{f}", "", 1, 0, target_entity or "")
 
-    # ✅ 标记为已初始化
     st.session_state[cache_key] = True
 
 
@@ -85,17 +85,79 @@ def _parse_nth_insert(table_name: str, index: int = 0):
             elif ch == ",": out.append("".join(buf).strip()); buf = []; i += 1
             else: buf.append(ch); i += 1
     out.append("".join(buf).strip())
-
-    def _norm(v):
-        v = v.strip()
-        if v.upper() == "NULL": return ""
-        if v.startswith("'") and v.endswith("'"):
-            return v[1:-1].replace("''","'")
-        return v
-
-    vals = [_norm(v) for v in out]
-    if len(cols) != len(vals): return None
+    # 转换值并返回 dict
+    def _convert(v: str):
+        s = (v or "").strip()
+        if s.lower() in ("null", "none"):
+            return ""
+        # 尝试数字
+        try:
+            if s.startswith("-") or s.isdigit():
+                return int(s)
+        except Exception:
+            pass
+        try:
+            if "." in s:
+                return float(s)
+        except Exception:
+            pass
+        return s
+    vals = [_convert(x) for x in out]
+    if len(cols) != len(vals):
+        return None
     return dict(zip(cols, vals))
+
+
+def _parse_all_inserts(table_name: str):
+    p = detect_sql_path(table_name)
+    if not p.exists():
+        return []
+    txt = p.read_text(encoding="utf-8", errors="ignore")
+    inserts = list(re.finditer(
+        r"insert\s+into\s+public\.\"?(?P<table>[\w\u4e00-\u9fa5]+)\"?"
+        r"\s*\((?P<cols>[^)]*)\)\s*values\s*\((?P<vals>[^)]*)\)",
+        txt, re.IGNORECASE
+    ))
+    out_records = []
+    for m in inserts:
+        cols = [c.strip().strip('"') for c in m.group("cols").split(",")]
+        raw = m.group("vals")
+        # 复用解析逻辑
+        buf, items, in_str, i = [], [], False, 0
+        while i < len(raw):
+            ch = raw[i]
+            if in_str:
+                if ch == "'":
+                    if i + 1 < len(raw) and raw[i + 1] == "'":
+                        buf.append("'"); i += 2
+                    else:
+                        in_str = False; i += 1
+                else:
+                    buf.append(ch); i += 1
+            else:
+                if ch == "'": in_str = True; i += 1
+                elif ch == ",": items.append("".join(buf).strip()); buf = []; i += 1
+                else: buf.append(ch); i += 1
+        items.append("".join(buf).strip())
+        def _convert(v: str):
+            s = (v or "").strip()
+            if s.lower() in ("null", "none"):
+                return ""
+            try:
+                if s.startswith("-") or s.isdigit():
+                    return int(s)
+            except Exception:
+                pass
+            try:
+                if "." in s:
+                    return float(s)
+            except Exception:
+                pass
+            return s
+        vals = [_convert(x) for x in items]
+        if len(cols) == len(vals):
+            out_records.append(dict(zip(cols, vals)))
+    return out_records
 
 
 def _guess_table_display_name(table_name: str) -> str:
@@ -121,41 +183,94 @@ def _guess_table_display_name(table_name: str) -> str:
 def render_table_detail(table_name: str):
     comment_map = detect_field_comments(table_name)
     st.title(f"表配置：{table_name}")
-    _ensure_all_fields_seeded(table_name)
 
-    # 缓存字段映射，避免重复插入
-    cache_key = f"table_cache_{table_name}"
+    # 读取当前 entity（优先会话，其次 URL，再次表默认）
+    current_entity = (
+        st.session_state.get("current_entity")
+        or st.query_params.get("entity", "")
+        or get_target_entity(table_name)
+    )
+    st.session_state["current_entity"] = current_entity
+
+    # ✅ 按当前实体做首次字段初始化（仅该实体缺失的字段）
+    _ensure_all_fields_seeded(table_name, current_entity or "")
+
+    # 缓存字段映射（按 table + entity 缓存）
+    cache_key = f"table_cache_{table_name}_{current_entity or ''}"
     if cache_key not in st.session_state:
-        st.session_state[cache_key] = get_field_mappings(table_name)
+        st.session_state[cache_key] = get_field_mappings(table_name, current_entity or None)
     mappings = st.session_state[cache_key]
 
-    # 表级配置
+    # 表级配置（当前管理目标 + 该目标的优先级）
     col1, col2 = st.columns([3, 1])
     with col1:
-        target_entity = st.text_input("默认目标 entity", value=get_target_entity(table_name))
+        # 用当前 entity 作为默认，允许调整（保存时按当前 entity upsert）
+        target_entity = st.text_input("当前管理目标 entity", value=current_entity)
     with col2:
-        priority = st.number_input("优先级", value=get_priority(table_name), step=1)
+        # 针对当前目标读取优先级
+        priority = st.number_input("优先级", value=get_priority(table_name, target_entity), step=1)
 
     if st.button("保存表配置", use_container_width=True):
-        save_table_mapping(table_name, target_entity, priority)
-        st.success("表配置已保存")
+        old_entity = (current_entity or "").strip()
+        new_entity = (target_entity or "").strip()
 
+        if not new_entity:
+            st.warning("目标 entity 不能为空。")
+        elif not old_entity:
+            # 详情页不允许创建新目标，请到『多映射管理中心』
+            st.warning("当前表未绑定目标。请到『🧩 多映射管理中心』创建目标实体。")
+        elif new_entity != old_entity:
+            # 执行原子重命名：同时迁移 table_map 和 field_map
+            try:
+                rename_table_target_entity(table_name, old_entity, new_entity)
+            except Exception as e:
+                st.error(f"重命名失败：{e}")
+            else:
+                # 切换会话与缓存到新目标
+                st.session_state["current_entity"] = new_entity
+                st.session_state.pop(cache_key, None)
+                new_cache_key = f"table_cache_{table_name}_{new_entity}"
+                st.session_state[new_cache_key] = get_field_mappings(table_name, new_entity)
+
+                # 同步更新 URL 的 query 参数，避免下一次被旧值覆盖
+                try:
+                    st.query_params["page"] = "detail"
+                    st.query_params["table"] = table_name
+                    st.query_params["entity"] = new_entity
+                except Exception:
+                    st.experimental_set_query_params(page="detail", table=table_name, entity=new_entity)
+
+                st.success(f"已重命名：{old_entity} → {new_entity}")
+                st.rerun()
+        else:
+            # 同名：仅保存优先级
+            save_table_mapping(table_name, new_entity, priority)
+            st.success("表配置已保存")
+
+    st.caption(f"当前管理目标：{target_entity or '(未指定，使用表默认)'}")
     st.markdown("---")
 
     # 表级 Python 脚本
     st.subheader("表级 Python 脚本")
     st.caption("在字段映射后执行，可直接修改 record。")
-    current_script = get_table_script(table_name) or ""
+    # 读取当前 entity 的脚本
+    current_script = get_table_script(table_name, target_entity or st.session_state.get("current_entity") or "") or ""
     py_script = st.text_area("自定义脚本", value=current_script, height=150)
     cols = st.columns([1, 1, 6])
     with cols[0]:
         if st.button("保存脚本"):
-            save_table_script(table_name, py_script or "")
-            st.success("脚本已保存")
+            ok = save_table_script(table_name, py_script or "", target_entity=target_entity or st.session_state.get("current_entity") or "")
+            if ok:
+                st.success("脚本已保存（当前 entity）")
+            else:
+                st.warning("当前 entity 未创建映射，请到『🧩 多映射管理中心』创建目标实体")
     with cols[1]:
         if st.button("清空脚本"):
-            save_table_script(table_name, "")
-            st.success("脚本已清空"); st.rerun()
+            ok = save_table_script(table_name, "", target_entity=target_entity or st.session_state.get("current_entity") or "")
+            if ok:
+                st.success("脚本已清空（当前 entity）"); st.rerun()
+            else:
+                st.warning("当前 entity 未创建映射，请到『🧩 多映射管理中心』创建目标实体")
 
     st.markdown("---")
 
@@ -198,7 +313,7 @@ def render_table_detail(table_name: str):
 
         with cols[4]:
             if st.button("💾", key=f"save_row_{table_name}_{idx}"):
-                update_field_mapping(table_name, sfield, m["target_paths"], m["rule"])
+                update_field_mapping(table_name, sfield, m["target_paths"], m["rule"], target_entity or "")
                 m.pop("__changed__", None)
                 st.session_state[cache_key][idx] = m
                 st.success(f"{sfield or '(自定义)'} 已保存")
@@ -206,7 +321,7 @@ def render_table_detail(table_name: str):
 
         with cols[5]:
             if st.button("🗑", key=f"del_row_{table_name}_{idx}"):
-                delete_field_mapping(table_name, sfield)
+                delete_field_mapping(table_name, sfield, target_entity or "")
                 st.session_state[cache_key] = [x for x in st.session_state[cache_key] if x["source_field"] != sfield]
                 st.success(f"{sfield or '(自定义)'} 已删除")
                 st.rerun()
@@ -217,7 +332,7 @@ def render_table_detail(table_name: str):
     if st.button("💾 一键保存全部修改", use_container_width=True):
         to_save = [m for m in edited_data if m.get("__changed__")]
         if to_save:
-            update_many_field_mappings(table_name, to_save)
+            update_many_field_mappings(table_name, to_save, target_entity or "")
             for m in to_save:
                 m.pop("__changed__", None)
             st.session_state[cache_key] = edited_data
@@ -226,7 +341,6 @@ def render_table_detail(table_name: str):
             st.info("没有需要保存的字段。")
 
     st.markdown("---")
-
     # 新增自定义映射
     st.subheader("新增自定义映射")
     with st.form(f"add_{table_name}"):
@@ -234,19 +348,75 @@ def render_table_detail(table_name: str):
         tgt = st.text_input("target_paths（例：data.name）")
         rule_new = st.text_input("rule（可空）")
         if st.form_submit_button("添加"):
-            upsert_field_mapping(table_name, src, tgt, rule_new)
-            st.session_state.pop(cache_key, None)
-            st.success("✅ 已添加新字段")
-            st.rerun()
+            # 查重：当前 (table + entity) 是否已有一条空 source_field 的映射
+            src_norm = (src or "").strip()
+            existing_list = st.session_state.get(cache_key) or get_field_mappings(table_name, target_entity or None)
+            has_empty_custom = any((m.get("source_field") or "") == "" for m in existing_list)
+
+            if src_norm == "" and has_empty_custom:
+                st.warning("当前已存在一条 source_field 为空的自定义映射，请填写 source_field 或修改现有记录。")
+            else:
+                upsert_field_mapping(table_name, src_norm, tgt, rule_new, target_entity=target_entity or "")
+                # 刷新当前 table+entity 的缓存，确保新映射立刻可见
+                st.session_state[cache_key] = get_field_mappings(table_name, target_entity or None)
+                st.success("已新增映射")
+                st.rerun()
 
     st.markdown("---")
 
     # 模拟打印
     st.subheader("模拟打印")
+    # 解析并缓存全部样例记录
+    samples_key = f"samples_{table_name}"
+    if samples_key not in st.session_state:
+        st.session_state[samples_key] = _parse_all_inserts(table_name)
+    full_list = st.session_state[samples_key]
+
+    # 查找筛选区域
+    st.caption("查找指定记录：填写字段名与值，支持非唯一匹配")
+    sf1, sf2, sf3, sf4 = st.columns([2, 2, 1, 1])
+    with sf1:
+        q_field = st.text_input("字段名", key=f"q_field_{table_name}")
+    with sf2:
+        q_value = st.text_input("字段值", key=f"q_value_{table_name}")
+    with sf3:
+        q_contains = st.checkbox("包含匹配", value=True, key=f"q_contains_{table_name}")
+    with sf4:
+        do_query = st.button("查询", key=f"do_query_{table_name}")
+
+    filter_key = f"filter_{table_name}"
+    idx_key = f"sample_idx_{table_name}"
+
+    if do_query:
+        fld = (q_field or "").strip()
+        val = (q_value or "").strip()
+        if fld and val:
+            def _match(rec):
+                rv = rec.get(fld)
+                if rv is None:
+                    return False
+                s = str(rv)
+                return (val in s) if q_contains else (s == val)
+            st.session_state[filter_key] = [r for r in full_list if _match(r)]
+            st.session_state[idx_key] = 0
+            st.info(f"筛选到 {len(st.session_state[filter_key])} 条记录（总 {len(full_list)} 条）")
+        else:
+            st.warning("请填写字段名与字段值后再查询。")
+
+    # 清除筛选
+    if st.button("清除筛选", key=f"clear_query_{table_name}"):
+        st.session_state.pop(filter_key, None)
+        st.session_state[idx_key] = 0
+
     idx_key = f"sample_idx_{table_name}"
     if idx_key not in st.session_state:
         st.session_state[idx_key] = 0
     sample_index = st.session_state[idx_key]
+
+    # 当前列表：优先过滤结果
+    curr_list = st.session_state.get(filter_key) or full_list
+    total_n = len(curr_list)
+    st.caption(f"当前预览索引：{sample_index + 1}/{max(total_n, 1)}（总 {len(full_list)} 条）")
 
     cols_pg = st.columns([1, 1, 6])
     with cols_pg[0]:
@@ -255,16 +425,20 @@ def render_table_detail(table_name: str):
                 st.session_state[idx_key] -= 1; st.rerun()
     with cols_pg[1]:
         if st.button("下一条 ➡️"):
-            st.session_state[idx_key] += 1; st.rerun()
+            if sample_index + 1 < total_n:
+                st.session_state[idx_key] += 1; st.rerun()
 
-    sample = _parse_nth_insert(table_name, sample_index) or {}
+    # 取当前样例
+    sample = curr_list[sample_index] if (0 <= sample_index < total_n) else {}
     with st.expander("SQL 样例记录", expanded=False):
         st.code(json.dumps(sample, ensure_ascii=False, indent=2))
 
     if st.button("生成模拟打印"):
         from backend.mapper_core import _extract_entity_meta
-        py_now = get_table_script(table_name) or ""
-        data_rec, out_name, type_override = apply_record_mapping(table_name, sample, py_now)
+        py_now = get_table_script(table_name, target_entity or st.session_state.get("current_entity") or "") or ""
+        data_rec, out_name, type_override = apply_record_mapping(
+            table_name, sample, py_now, target_entity=target_entity or st.session_state.get("current_entity") or ""
+        )
 
         # ⬇️ 抽 meta 并从 data_rec 中剔除
         meta = _extract_entity_meta(data_rec)
@@ -272,19 +446,109 @@ def render_table_detail(table_name: str):
         preview = {
             "uuid": "(mock uuid)",
             "sid": SID,
-            "type": type_override or table_name,
+            "type": type_override or (target_entity or table_name),
             "name": out_name or "",
-            "del": int(meta["del"]),  # 顶层
-            "input_date": int(meta["input_date"]),  # 顶层
-            "update_date": int(meta["update_date"]),  # 顶层
-            "data": data_rec  # 不再含 del/input_date/update_date
+            "del": int(meta["del"]),
+            "input_date": int(meta["input_date"]),
+            "update_date": int(meta["update_date"]),
+            "data": data_rec
         }
         st.success("生成成功：")
         st.code(json.dumps(preview, ensure_ascii=False, indent=2))
 
+    # 字段专注模式
+    st.subheader("字段专注模式")
+    st.caption("填写字段名（用逗号分隔）。支持两种格式：name（外层），data.xxx（映射后的 data 内部字段，支持多级）。")
+    focus_fields_key = f"focus_fields_{table_name}"
+    focus_page_key = f"focus_page_{table_name}"
+    focus_page_size_key = f"focus_page_size_{table_name}"
+
+    ff_cols = st.columns([5, 1, 1, 1])
+    with ff_cols[0]:
+        fields_input = st.text_input("字段列表", value=st.session_state.get(focus_fields_key, "name"))
+    with ff_cols[1]:
+        page_size = st.number_input("每页数量", value=int(st.session_state.get(focus_page_size_key, 20)), min_value=5, max_value=200, step=5)
+    with ff_cols[2]:
+        gen_focus = st.button("生成")
+    with ff_cols[3]:
+        clear_focus = st.button("清空")
+
+    # 解析字段列表
+    def _parse_fields(s: str):
+        return [x.strip() for x in (s or "").split(",") if x.strip()]
+
+    if clear_focus:
+        st.session_state.pop(focus_fields_key, None)
+        st.session_state.pop(focus_page_key, None)
+        st.session_state.pop(focus_page_size_key, None)
+
+    if gen_focus:
+        flds = _parse_fields(fields_input)
+        if not flds:
+            st.warning("请填写至少一个字段。")
+        else:
+            st.session_state[focus_fields_key] = fields_input
+            st.session_state[focus_page_key] = 0
+            st.session_state[focus_page_size_key] = int(page_size)
+
+    # 若已有字段配置，按分页打印所有记录的字段值
+    if focus_fields_key in st.session_state:
+        flds = _parse_fields(st.session_state[focus_fields_key])
+        page = int(st.session_state.get(focus_page_key, 0))
+        size = int(st.session_state.get(focus_page_size_key, 20))
+
+        # 当前列表：优先过滤结果
+        curr_list = st.session_state.get(filter_key) or full_list
+        total_n = len(curr_list)
+        total_pages = max(1, (total_n + size - 1) // size)
+        start = page * size
+        end = min(start + size, total_n)
+
+        # 顶部分页信息与跳转
+        pg_cols = st.columns([1, 1, 4])
+        with pg_cols[0]:
+            if st.button("⬅️ 上一页", disabled=(page <= 0)):
+                st.session_state[focus_page_key] = max(0, page - 1); st.rerun()
+        with pg_cols[1]:
+            if st.button("下一页 ➡️", disabled=(page + 1 >= total_pages)):
+                st.session_state[focus_page_key] = min(total_pages - 1, page + 1); st.rerun()
+        with pg_cols[2]:
+            st.caption(f"当前页：{page + 1}/{total_pages}，范围 {start + 1}-{end}，总 {total_n} 条")
+
+        # 计算当前页的映射并抽取字段
+        py_now = get_table_script(table_name, target_entity or st.session_state.get("current_entity") or "") or ""
+        rows = []
+        def _get_data_path(d: dict, path: str):
+            v = d
+            for seg in [x for x in path.split(".") if x]:
+                if isinstance(v, dict):
+                    v = v.get(seg, "")
+                else:
+                    return ""
+            return v if v is not None else ""
+
+        for i, rec in enumerate(curr_list[start:end], start=start):
+            data_rec, out_name, type_override = apply_record_mapping(
+                table_name, rec, py_now, target_entity=target_entity or st.session_state.get("current_entity") or ""
+            )
+            name_val = (data_rec.get("__name__") or out_name or "")
+            row = {"#": i + 1}
+            for f in flds:
+                if f == "name":
+                    row[f] = name_val
+                elif f.startswith("data."):
+                    row[f] = _get_data_path(data_rec, f[5:])
+                else:
+                    # 未知格式，尝试直接取映射后的顶层字段
+                    row[f] = data_rec.get(f, "")
+            rows.append(row)
+
+        st.dataframe(rows, use_container_width=True)
+
     if st.button("返回列表"):
         st.session_state.page = "list"
         st.session_state.current_table = ""
+        st.session_state.current_entity = ""
         st.rerun()
 
 
@@ -334,7 +598,11 @@ def render_mapped_tables():
 
         cols = st.columns([3, 3, 3, 1, 1, 2])
         cols[0].text(disp_name)
-        cols[1].markdown(f"[{src}](?page=detail&table={src})", unsafe_allow_html=True)
+        # 跳转时携带 entity 参数，直达该目标的详情页（新标签页打开）
+        cols[1].markdown(
+            f'<a href="?page=detail&table={src}&entity={tgt}" target="_blank">{src}</a>',
+            unsafe_allow_html=True
+        )
         cols[2].text(tgt)
         cols[3].text("✅" if count > 0 else "❌")
         cols[4].text(str(pri))
@@ -342,16 +610,85 @@ def render_mapped_tables():
         with cols[5]:
             b1, b2 = st.columns([1,1])
             with b1:
-                if st.button("入库", key=f"imp_{src}"):
-                    n = import_table_data(src, sid=SID)
+                if st.button("入库", key=f"imp_{src}_{tgt}"):
+                    # 显式传入本行的 target_entity，避免多映射时混淆
+                    n = import_table_data(src, sid=SID, target_entity_spec=tgt)
                     st.success(f"入库完成：写入 {n} 条")
                     st.rerun()
             with b2:
-                if st.button("删除", key=f"del_{src}"):
+                if st.button("删除", key=f"del_{src}_{tgt}"):
                     n = delete_table_data(tgt)
                     st.success(f"删除完成：清理 {n} 条")
                     st.rerun()
 
+# ==========================================================
+# 🧩 多映射管理页（支持单表多 target_entity）
+# ==========================================================
+import streamlit as st
+from backend.db import list_tables, list_table_targets, upsert_field_mapping,delete_table_mapping
+from backend.mapper_core import import_table_data, delete_table_data, check_entity_status
+from version3 import SID
+
+@st.cache_data(ttl=30)
+def _cached_list_tables():
+    return [r[0] for r in list_tables()]
+
+def render_multi_mapping():
+    st.title("🧩 多映射管理中心")
+
+    rows = list_mapped_tables()
+    if not rows:
+        st.info("暂无已设置映射目标。")
+    else:
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            if st.button("➕ 新建映射目标"):
+                st.session_state["creating_map"] = True
+        with c2:
+            if st.button("🔄 刷新"):
+                st.rerun()
+
+        st.divider()
+
+        for r in rows:
+            src, tgt, desc = r["source_table"], r["target_entity"], r["description"]
+            pri = r.get("priority", 0)
+            cols = st.columns([3, 3, 3, 2])
+            # 源表列改为可点击跳详情（携带 entity，新标签页打开）
+            cols[0].markdown(
+                f'🗂️ <a href="?page=detail&table={src}&entity={tgt}" target="_blank"><code>{src}</code></a>',
+                unsafe_allow_html=True
+            )
+            cols[1].markdown(f"🎯 `{tgt}`")
+            new_desc = cols[2].text_input("描述", value=desc or "", key=f"desc_{src}_{tgt}")
+            with cols[3]:
+                b1, b2 = st.columns([1,1])
+                with b1:
+                    if st.button("保存", key=f"save_{src}_{tgt}"):
+                        save_table_mapping(src, tgt, pri, new_desc or "")
+                        st.success("描述已更新")
+                        st.rerun()
+                with b2:
+                    if st.button("❌ 删除", key=f"del_{src}_{tgt}"):
+                        delete_table_mapping(src, tgt)
+                        st.success(f"已删除映射 {src} → {tgt}")
+                        st.rerun()
+
+            # ========== 创建新映射弹窗 ==========
+        if st.session_state.get("creating_map"):
+            st.subheader("➕ 新建映射目标")
+            table_name = st.text_input("源表名")
+            target_entity = st.text_input("目标实体名")
+            desc = st.text_input("描述", "自动生成的映射")
+            pri = st.number_input("优先级", value=0)
+            if st.button("创建映射"):
+                save_table_mapping(table_name, target_entity, pri, desc)
+                # ✅ 新建后立即为该实体生成基础字段映射（不覆盖既有字段）
+                _ensure_all_fields_seeded(table_name, target_entity or "")
+                st.success("✅ 新映射已创建，并初始化基础字段映射")
+                st.session_state["creating_map"] = False
+                st.rerun()
+        st.markdown("---")
 
 # ================= 列表页（原有） =================
 def render_table_list():
@@ -377,10 +714,13 @@ def render_table_list():
 
     st.markdown("---")
 
-    # 入口：映射结果管理
-    if st.button("🧩 映射结果管理", type="secondary"):
-        st.session_state.page = "mapped"
-        st.rerun()
+    # 入口：映射结果管理 / 多映射管理中心（按钮式链接，点击在新标签页打开）
+    cols_nav = st.columns([2, 2, 6])
+    btn_style = "display:inline-block;padding:.5rem 1rem;border-radius:.5rem;border:1px solid #d0d0d0;background:#f6f6f6;text-decoration:none;color:#222;"
+    with cols_nav[0]:
+        st.markdown(f'<a href="?page=mapped" target="_blank" style="{btn_style}">🧩 映射结果管理</a>', unsafe_allow_html=True)
+    with cols_nav[1]:
+        st.markdown(f'<a href="?page=multi_mapping" target="_blank" style="{btn_style}">🧩 多映射管理中心</a>', unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -399,17 +739,18 @@ def render_table_list():
     for src, tgt, pri, dis, desc in rows:
         col = st.columns([3, 3, 1, 1, 2])
         with col[0]:
-            st.markdown(f"[{src}](?page=detail&table={src})", unsafe_allow_html=True)
+            link = f"?page=detail&table={src}" + (f"&entity={tgt}" if (tgt or "").strip() else "")
+            st.markdown(f"[{src}]({link})", unsafe_allow_html=True)
         with col[1]:
             st.text(tgt or "")
         with col[2]:
             st.text(str(pri))
         with col[3]:
             if dis:
-                if st.button("恢复", key=f"res_{src}"):
+                if st.button("恢复", key=f"res_{src}_{tgt}"):
                     restore_table(src); st.rerun()
             else:
-                if st.button("停用", key=f"del_{src}"):
+                if st.button("停用", key=f"del_{src}_{tgt}"):
                     soft_delete_table(src); st.rerun()
         with col[4]:
             st.text("停用" if dis else "启用")
@@ -420,15 +761,20 @@ def main():
     if "page" not in st.session_state:
         st.session_state.page = "list"
         st.session_state.current_table = ""
+        st.session_state.current_entity = ""
 
     q = st.query_params
     if "page" in q:
         st.session_state.page = q["page"]
     if "table" in q:
         st.session_state.current_table = q["table"]
+    if "entity" in q:
+        st.session_state.current_entity = q["entity"]
 
     if st.session_state.page == "list":
         render_table_list()
+    elif st.session_state.page == "multi_mapping":
+        render_multi_mapping()
     elif st.session_state.page == "mapped":
         render_mapped_tables()
     else:

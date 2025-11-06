@@ -1,5 +1,7 @@
 from datetime import datetime
 
+from pyarrow import uuid
+
 val = record.get('fund_record_time') or record.get('data', {}).get('lrb5u0an6w')
 if val:
     try:
@@ -17,3 +19,10 @@ entity(import_fund_info:data.fund_id=record.id).manager
 sql.import_fund_info(sql.import_fund_info.fund_id=record.id).manager
 {'A股':'A股','港股':'港股','美股':'美股','新三板':'新三板','新四板':'新四板'}
 py:{'1':'自主基金项目','2':'参股基金项目','3':'股权直投项目','4':'债权项目','5':'子基金项目','6':'其他'}.get(sproject_status,'其他')
+
+record.fund_name||record.fund_name||entity.fund(sql.ct_fof_subfund_mid.subfund_id=record.id).uuid
+entity.fund(entity.fund.data.id=sql.ct_fof_subfund_mid(sql.ct_fof_subfund_mid.subfund_id=record.id).fof_id).uuid
+entity.fund(data.id = sql.ct_fof_subfund_mid(subfund_id = record.id).fof_id).uuid
+
+
+entity.fund(data.id =record.id).data.fund_name|| record.fund_name||entity.fund(data.id=record.id).uuid
