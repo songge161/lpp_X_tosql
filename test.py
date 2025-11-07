@@ -26,3 +26,4 @@ entity.fund(data.id = sql.ct_fof_subfund_mid(subfund_id = record.id).fof_id).uui
 
 
 entity.fund(data.id =record.id).data.fund_name|| record.fund_name||entity.fund(data.id=record.id).uuid
+py:{'1':'集成电路','2':'电子信息','3':'高端软件','4':'人工智能','5':'汽车','6':'专用装备','7':'高端数控机床与机器人','8':'新能源装备','9':'空天信息','10':'先进材料','11':'钢铁','12':'现代医药','13':'食品与生物制造'}.get(sing_industry_line,'未分类')
