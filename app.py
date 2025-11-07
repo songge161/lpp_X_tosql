@@ -670,9 +670,31 @@ def render_multi_mapping():
                         st.rerun()
                 with b2:
                     if st.button("❌ 删除", key=f"del_{src}_{tgt}"):
-                        delete_table_mapping(src, tgt)
-                        st.success(f"已删除映射 {src} → {tgt}")
-                        st.rerun()
+                        # 弹出确认层：携带表/实体/描述
+                        st.session_state["confirm_del_show"] = True
+                        st.session_state["confirm_del_src"] = src
+                        st.session_state["confirm_del_tgt"] = tgt
+                        st.session_state["confirm_del_desc"] = new_desc or ""
+
+        # 删除确认弹层（全局唯一）
+        if st.session_state.get("confirm_del_show"):
+            st.warning(
+                f"确认删除该映射？\n\n- 源表：{st.session_state.get('confirm_del_src','')}\n- 实体：{st.session_state.get('confirm_del_tgt','')}\n- 描述：{st.session_state.get('confirm_del_desc','')}\n\n删除后会同时清理该实体下的所有字段映射。"
+            )
+            cdel = st.columns([1,1,6])
+            with cdel[0]:
+                if st.button("确定删除", key="confirm_delete_go"):
+                    delete_table_mapping(st.session_state.get("confirm_del_src",""), st.session_state.get("confirm_del_tgt",""))
+                    st.success("已删除映射，并清理对应字段")
+                    st.session_state["confirm_del_show"] = False
+                    st.session_state.pop("confirm_del_src", None)
+                    st.session_state.pop("confirm_del_tgt", None)
+                    st.session_state.pop("confirm_del_desc", None)
+                    st.rerun()
+            with cdel[1]:
+                if st.button("取消", key="confirm_delete_cancel"):
+                    st.session_state["confirm_del_show"] = False
+                    st.rerun()
 
             # ========== 创建新映射弹窗 ==========
         if st.session_state.get("creating_map"):
