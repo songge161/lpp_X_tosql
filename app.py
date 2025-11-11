@@ -16,6 +16,8 @@ from backend.db import (
 )
 from backend.source_fields import detect_source_fields, detect_sql_path,detect_field_comments, detect_table_title
 from backend.mapper_core import apply_record_mapping, check_entity_status, import_table_data, delete_table_data
+from backend.sql_utils import update_runtime_db, current_cfg
+from backend.presets import init_presets_db, list_presets, save_preset, delete_preset, get_last_runtime, save_last_runtime
 
 try:
     from version3 import SID
@@ -24,6 +26,174 @@ except Exception:
 
 st.set_page_config(page_title="表映射管理工具", layout="wide")
 init_db()
+init_presets_db()
+
+# =============== 侧边栏：数据库与 SID 选择 ===============
+if "db_kind" not in st.session_state:
+    st.session_state.db_kind = "mysql"
+if "db_cfg" not in st.session_state:
+    st.session_state.db_cfg = {
+        "host": "127.0.0.1",
+        "port": 3307,
+        "user": "im",
+        "password": "root",
+        "database": "im",
+        "charset": "utf8mb4",
+        "autocommit": False,
+        "schema": "public",  # 仅 PG 使用
+    }
+if "current_sid" not in st.session_state:
+    st.session_state.current_sid = SID
+
+# 启动时尝试恢复最近一次应用的运行时配置
+_last = get_last_runtime()
+if _last:
+    st.session_state.db_kind = _last.get("kind") or st.session_state.db_kind
+    st.session_state.db_cfg = {
+        "host": _last.get("host", st.session_state.db_cfg.get("host")),
+        "port": int(_last.get("port", st.session_state.db_cfg.get("port"))),
+        "user": _last.get("user", st.session_state.db_cfg.get("user")),
+        "password": _last.get("password", st.session_state.db_cfg.get("password")),
+        "database": _last.get("database", st.session_state.db_cfg.get("database")),
+        "charset": _last.get("charset", st.session_state.db_cfg.get("charset")),
+        "autocommit": bool(_last.get("autocommit", st.session_state.db_cfg.get("autocommit"))),
+        "schema": _last.get("schema", st.session_state.db_cfg.get("schema")),
+    }
+    # 兼容：如无 sid 则回退使用 schema
+    st.session_state.current_sid = _last.get("sid") or _last.get("schema") or st.session_state.current_sid
+    try:
+        update_runtime_db(st.session_state.db_kind, st.session_state.db_cfg)
+    except Exception as e:
+        st.warning(f"恢复上次配置失败：{e}")
+
+with st.sidebar:
+    st.header("库/空间目标")
+    st.caption("列表：名称-sid（删除：❌）；支持添加与应用")
+
+    # 预设列表：点击即切换
+    presets = list_presets()
+    if presets:
+        for p in presets:
+            disp_label = (p.get('name') or '').strip()
+            # 兼容旧预设：无 sid 则显示 schema
+            sid_label = (p.get('sid') or p.get('schema') or '').strip()
+            label = f"{disp_label}-{sid_label}" if sid_label else disp_label
+            cols_row = st.columns([4, 1])
+            with cols_row[0]:
+                if st.button(label or "(未命名)", key=f"preset_select_{p.get('name','')}"):
+                    st.session_state["selected_preset_name"] = p.get("name")
+                    st.session_state["selected_preset_label"] = label or p.get("name")
+            with cols_row[1]:
+                if st.button("❌", key=f"preset_del_{p.get('name','')}"):
+                    try:
+                        delete_preset(p.get("name"))
+                        st.success("已删除预设")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"删除失败：{e}")
+        if st.session_state.get("selected_preset_label"):
+            st.caption(f"已选中：{st.session_state.get('selected_preset_label')}")
+    else:
+        st.info("暂无预设，请点击下方『添加』进行创建")
+
+    # 交互：添加 & 应用
+    ctrl_cols = st.columns([1, 1])
+    with ctrl_cols[0]:
+        if st.button("添加"):
+            st.session_state["show_add_panel"] = True
+    with ctrl_cols[1]:
+        if st.button("应用"):
+            sel_name = st.session_state.get("selected_preset_name")
+            if not sel_name:
+                st.warning("请先在上方列表里选择一个条目。")
+            else:
+                # 找到并应用
+                presets = list_presets()
+                target = next((x for x in presets if x.get("name") == sel_name), None)
+                if not target:
+                    st.warning("选中的条目不存在，请刷新后重试。")
+                else:
+                    st.session_state.db_kind = (target.get("kind") or st.session_state.db_kind)
+                    st.session_state.db_cfg = {
+                        "host": target.get("host") or st.session_state.db_cfg.get("host"),
+                        "port": int(target.get("port") or st.session_state.db_cfg.get("port")),
+                        "user": target.get("user") or st.session_state.db_cfg.get("user"),
+                        "password": target.get("password") or st.session_state.db_cfg.get("password"),
+                        "database": target.get("database") or st.session_state.db_cfg.get("database"),
+                        "charset": target.get("charset") or st.session_state.db_cfg.get("charset"),
+                        "autocommit": bool(target.get("autocommit") if target.get("autocommit") is not None else st.session_state.db_cfg.get("autocommit")),
+                        # 统一：schema 即为 SID；兼容旧数据使用 schema
+                        "schema": target.get("sid") or target.get("schema") or st.session_state.db_cfg.get("schema"),
+                    }
+                    # 同步当前 SID，兼容旧数据
+                    st.session_state.current_sid = target.get("sid") or target.get("schema") or st.session_state.current_sid
+                    try:
+                        update_runtime_db(st.session_state.db_kind, st.session_state.db_cfg)
+                        save_last_runtime(st.session_state.db_kind, st.session_state.db_cfg, st.session_state.current_sid)
+                        st.success("已应用选中条目")
+                    except Exception as e:
+                        st.error(f"应用失败：{e}")
+                    st.rerun()
+
+    # 添加面板（弹出式）
+    if st.session_state.get("show_add_panel"):
+        with st.form("add_preset_form"):
+            st.subheader("添加库连接与SID")
+            preset_name = st.text_input("名称", value="")
+            kind_label_to_val = {"mysql": "mysql", "postgres": "pg"}
+            kind_choice = st.selectbox("数据库类型", options=list(kind_label_to_val.keys()), index=0)
+            host_inp = st.text_input("主机", value=st.session_state.db_cfg.get("host", "127.0.0.1"))
+            port_inp = st.number_input("端口", value=int(st.session_state.db_cfg.get("port", 3306)), step=1)
+            user_inp = st.text_input("用户", value=st.session_state.db_cfg.get("user", "root"))
+            pwd_inp  = st.text_input("密码", value=st.session_state.db_cfg.get("password", ""))
+            db_inp   = st.text_input("库/数据库", value=st.session_state.db_cfg.get("database", ""))
+            # 统一：空间即 SID
+            schema_inp = st.text_input("空间(sid)", value=st.session_state.db_cfg.get("schema", ""))
+
+            c1, c2 = st.columns([1,1])
+            with c1:
+                do_save = st.form_submit_button("保存")
+            with c2:
+                do_cancel = st.form_submit_button("取消")
+
+            if do_cancel:
+                st.session_state["show_add_panel"] = False
+                st.rerun()
+
+            if do_save:
+                name_norm = (preset_name or "").strip()
+                if not name_norm:
+                    st.warning("请填写预设名称。")
+                elif not db_inp:
+                    st.warning("请填写库/数据库名称。")
+                else:
+                    try:
+                        save_preset(
+                            name=name_norm,
+                            kind=kind_label_to_val.get(kind_choice, "mysql"),
+                            host=host_inp,
+                            port=int(port_inp or 0),
+                            user=user_inp,
+                            password=pwd_inp,
+                            database=db_inp,
+                            charset=st.session_state.db_cfg.get("charset"),
+                            autocommit=st.session_state.db_cfg.get("autocommit"),
+                            # 同步保存：schema 与 sid 使用同一值
+                            schema=(schema_inp or None),
+                            sid=(schema_inp or None),
+                        )
+                        # 关闭添加面板并选中新建条目
+                        st.session_state["show_add_panel"] = False
+                        new_label = f"{name_norm}-{(schema_inp or '').strip()}" if (schema_inp or '').strip() else name_norm
+                        st.session_state["selected_preset_name"] = name_norm
+                        st.session_state["selected_preset_label"] = new_label
+                        st.success("✅ 预设已保存")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"保存失败：{e}")
+
+    # 批次（SID）单独维护
+    # 已统一：SID 即为空间(schema)，不再单独维护
 
 
 # ================= 工具函数 =================
@@ -184,6 +354,28 @@ def render_table_detail(table_name: str):
     comment_map = detect_field_comments(table_name)
     st.title(f"表配置：{table_name}")
 
+    # 浮动导航（详情页快速跳转）
+    st.markdown(
+        """
+        <style>
+        .fixed-nav { position: fixed; top: 100px; right: 24px; background: rgba(30,30,30,0.9); color:#fff; padding: 10px 12px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 9999; font-size: 13px; }
+        .fixed-nav .title { font-weight: 600; margin-bottom: 8px; }
+        .fixed-nav a { display:block; color:#fff; text-decoration: none; padding: 4px 0; }
+        .fixed-nav a:hover { text-decoration: underline; }
+        </style>
+        <div class="fixed-nav">
+          <div class="title">🔎 快速导航</div>
+          <a href="#sec-config">表配置</a>
+          <a href="#sec-script">表级脚本</a>
+          <a href="#sec-mapping">字段映射</a>
+          <a href="#sec-add">新增映射</a>
+          <a href="#sec-print">模拟打印</a>
+          <a href="#sec-focus">字段专注</a>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     # 读取当前 entity（优先会话，其次 URL，再次表默认）
     current_entity = (
         st.session_state.get("current_entity")
@@ -202,6 +394,7 @@ def render_table_detail(table_name: str):
     mappings = st.session_state[cache_key]
 
     # 表级配置（当前管理目标 + 该目标的优先级）
+    st.markdown("<div id=\"sec-config\"></div>", unsafe_allow_html=True)
     col1, col2 = st.columns([3, 1])
     with col1:
         # 用当前 entity 作为默认，允许调整（保存时按当前 entity upsert）
@@ -251,6 +444,7 @@ def render_table_detail(table_name: str):
     st.markdown("---")
 
     # 表级 Python 脚本
+    st.markdown("<div id=\"sec-script\"></div>", unsafe_allow_html=True)
     st.subheader("表级 Python 脚本")
     st.caption("在字段映射后执行，可直接修改 record。")
     # 读取当前 entity 的脚本
@@ -275,6 +469,7 @@ def render_table_detail(table_name: str):
     st.markdown("---")
 
     # 字段映射（压缩行 + 单行保存 + 一键保存）
+    st.markdown("<div id=\"sec-mapping\"></div>", unsafe_allow_html=True)
     st.subheader("字段映射配置（压缩行显示）")
     st.caption("每条一行：修改后点💾保存；底部支持一键保存全部。")
 
@@ -342,6 +537,7 @@ def render_table_detail(table_name: str):
 
     st.markdown("---")
     # 新增自定义映射
+    st.markdown("<div id=\"sec-add\"></div>", unsafe_allow_html=True)
     st.subheader("新增自定义映射")
     with st.form(f"add_{table_name}"):
         src = st.text_input("source_field（可空）")
@@ -365,6 +561,7 @@ def render_table_detail(table_name: str):
     st.markdown("---")
 
     # 模拟打印
+    st.markdown("<div id=\"sec-print\"></div>", unsafe_allow_html=True)
     st.subheader("模拟打印")
     # 解析并缓存全部样例记录
     samples_key = f"samples_{table_name}"
@@ -457,6 +654,7 @@ def render_table_detail(table_name: str):
         st.code(json.dumps(preview, ensure_ascii=False, indent=2))
 
     # 字段专注模式
+    st.markdown("<div id=\"sec-focus\"></div>", unsafe_allow_html=True)
     st.subheader("字段专注模式")
     st.caption("填写字段名（用逗号分隔）。支持两种格式：name（外层），data.xxx（映射后的 data 内部字段，支持多级）。")
     focus_fields_key = f"focus_fields_{table_name}"
@@ -579,13 +777,18 @@ def render_mapped_tables():
         if st.button("一键入库（全部）", type="primary"):
             total = 0
             for r in rows:
-                total += import_table_data(r["source_table"], sid=SID, target_entity_spec=r["target_entity"], import_mode=bulk_mode_label_to_val.get(bulk_mode, "upsert"))
+                total += import_table_data(
+                    r["source_table"],
+                    sid=st.session_state.get("current_sid", SID),
+                    target_entity_spec=r["target_entity"],
+                    import_mode=bulk_mode_label_to_val.get(bulk_mode, "upsert")
+                )
             st.success(f"✅ 完成入库（{bulk_mode}），总计写入 {total} 条。")
     with c2:
         if st.button("一键删除（全部）"):
             total_del = 0
             for r in rows:
-                total_del += delete_table_data(r["target_entity"], sid=SID) 
+                total_del += delete_table_data(r["target_entity"], sid=st.session_state.get("current_sid", SID)) 
             st.success(f"🗑 已删除 {total_del} 条（按 type 汇总）。")
 
     st.markdown("---")
@@ -605,7 +808,7 @@ def render_mapped_tables():
         tgt = r["target_entity"]
         pri = r["priority"]
         disp_name = _guess_table_display_name(src)
-        count = check_entity_status(tgt)
+        count = check_entity_status(tgt, sid=st.session_state.get("current_sid", SID))
         status = "✅ 已入库" if count > 0 else "❌ 未入库"
 
         cols = st.columns([3, 3, 3, 1, 1, 3])
@@ -638,7 +841,7 @@ def render_mapped_tables():
                     # 显式传入本行的 target_entity，避免多映射时混淆
                     n = import_table_data(
                         src,
-                        sid=SID,
+                        sid=st.session_state.get("current_sid", SID),
                         target_entity_spec=tgt,
                         import_mode=mode_label_to_val.get(row_mode_label, "upsert")
                     )
@@ -646,17 +849,15 @@ def render_mapped_tables():
                     st.rerun()
             with b2:
                 if st.button("删除", key=f"del_{src}_{tgt}"):
-                    n = delete_table_data(tgt, sid=SID)
+                    n = delete_table_data(tgt, sid=st.session_state.get("current_sid", SID))
                     st.success(f"删除完成：清理 {n} 条")
                     st.rerun()
 
 # ==========================================================
 # 🧩 多映射管理页（支持单表多 target_entity）
 # ==========================================================
-import streamlit as st
 from backend.db import list_tables, list_table_targets, upsert_field_mapping,delete_table_mapping
 from backend.mapper_core import import_table_data, delete_table_data, check_entity_status
-from version3 import SID
 
 @st.cache_data(ttl=30)
 def _cached_list_tables():

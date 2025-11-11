@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from backend.db import list_tables, get_priority, get_field_mappings, get_target_entity
 from backend.source_fields import detect_sql_path
+from backend.sql_utils import get_conn, is_pg, json_equals_clause
 
 try:
     from version3 import MYSQL_CFG, SID
@@ -126,31 +127,31 @@ def __date_ts__(v) -> int:
     return int(time.time())
 # ================= 安全 Entity Fetch =================
 def _entity_fetch(type_name: str, where_field: str, where_val: Any, target_path: str) -> Optional[Any]:
-    """安全的 entity 查询：未命中返回 None，不复用旧缓存。"""
+    """安全的 entity 查询：未命中返回 None，不复用旧缓存。
+    兼容 MySQL 与 PostgreSQL。
+    """
     key = f"E:{type_name}:{where_field}={where_val}:{target_path}"
     conn = None
     try:
-        conn = pymysql.connect(**MYSQL_CFG)
+        conn = get_conn()
         with conn.cursor() as cur:
             if target_path == "uuid":
-                sql = """
-                    SELECT uuid FROM entity
-                    WHERE type=%s AND JSON_UNQUOTE(JSON_EXTRACT(data,%s))=%s LIMIT 1
-                """
-                cur.execute(sql, (type_name, f"$.{where_field}", where_val))
+                sql = f"SELECT uuid FROM entity WHERE type=%s AND {json_equals_clause('data', where_field)} LIMIT 1"
+                cur.execute(sql, (type_name, str(where_val)))
             else:
-                path = "$." + target_path.replace("data.", "")
-                sql = """
-                    SELECT JSON_UNQUOTE(JSON_EXTRACT(data,%s))
-                    FROM entity WHERE type=%s AND JSON_UNQUOTE(JSON_EXTRACT(data,%s))=%s LIMIT 1
-                """
-                cur.execute(sql, (path, type_name, f"$.{where_field}", where_val))
+                # 目标路径统一从 data JSON 里取文本
+                tpath = target_path.replace("data.", "")
+                if is_pg():
+                    sql = f"SELECT data->>'{tpath}' FROM entity WHERE type=%s AND {json_equals_clause('data', where_field)} LIMIT 1"
+                    cur.execute(sql, (type_name, str(where_val)))
+                else:
+                    sql = f"SELECT JSON_UNQUOTE(JSON_EXTRACT(data, '$.{tpath}')) FROM entity WHERE type=%s AND {json_equals_clause('data', where_field)} LIMIT 1"
+                    cur.execute(sql, (type_name, str(where_val)))
             row = cur.fetchone()
             if row and row[0]:
                 _CACHE[key] = row[0]
                 return row[0]
             else:
-                # ❗没查到时，强制清理缓存旧值
                 if key in _CACHE:
                     del _CACHE[key]
                 return None
@@ -592,23 +593,43 @@ def _parse_sql_file(sql_path: Path) -> List[Dict[str, Any]]:
     return entities
 
 def _ensure_entity_table(conn):
-    sql = """
-    CREATE TABLE IF NOT EXISTS entity (
-        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-        uuid VARCHAR(64) NOT NULL,
-        sid VARCHAR(64) NOT NULL,
-        name VARCHAR(255) NOT NULL,
-        type VARCHAR(128) NOT NULL,
-        data JSON NOT NULL,
-        del TINYINT DEFAULT 0,
-        input_date BIGINT DEFAULT 0,
-        update_date BIGINT DEFAULT 0,
-        KEY idx_type (type),
-        KEY idx_sid (sid)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """
     with conn.cursor() as cur:
-        cur.execute(sql)
+        if is_pg():
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS entity (
+                    id BIGSERIAL PRIMARY KEY,
+                    uuid VARCHAR(64) NOT NULL,
+                    sid VARCHAR(64) NOT NULL,
+                    name VARCHAR(255) NOT NULL,
+                    type VARCHAR(128) NOT NULL,
+                    data JSONB NOT NULL,
+                    del SMALLINT DEFAULT 0,
+                    input_date BIGINT DEFAULT 0,
+                    update_date BIGINT DEFAULT 0
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_entity_type ON entity(type);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_entity_sid ON entity(sid);")
+        else:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS entity (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    uuid VARCHAR(64) NOT NULL,
+                    sid VARCHAR(64) NOT NULL,
+                    name VARCHAR(255) NOT NULL,
+                    type VARCHAR(128) NOT NULL,
+                    data JSON NOT NULL,
+                    del TINYINT DEFAULT 0,
+                    input_date BIGINT DEFAULT 0,
+                    update_date BIGINT DEFAULT 0,
+                    KEY idx_type (type),
+                    KEY idx_sid (sid)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """
+            )
 
 def _make_uuid10() -> str:
     n = int(time.time() * 1e6)
@@ -707,16 +728,16 @@ def _upsert_entity_row(type_name: str, key_field: str, key_value: Any,
         # 没有唯一键值，不写
         return 0
 
-    conn = pymysql.connect(**MYSQL_CFG)
+    conn = get_conn()
     try:
         with conn.cursor() as cur:
             # 查询是否已存在该唯一键
-            sel_sql = """
+            sel_sql = f"""
                 SELECT uuid, name, data FROM entity
-                WHERE type=%s AND JSON_UNQUOTE(JSON_EXTRACT(data, %s))=%s
+                WHERE type=%s AND {json_equals_clause('data', key_field)}
                 LIMIT 1
             """
-            cur.execute(sel_sql, (type_name, f"$.{key_field}", str(key_value)))
+            cur.execute(sel_sql, (type_name, str(key_value)))
             row = cur.fetchone()
 
             if row:  # 命中
@@ -746,7 +767,7 @@ def _upsert_entity_row(type_name: str, key_field: str, key_value: Any,
                         UPDATE entity
                         SET name=%s,
                             data=%s,
-                            `del`=%s,
+                            del=%s,
                             update_date=%s
                         WHERE uuid=%s
                     """
@@ -761,7 +782,7 @@ def _upsert_entity_row(type_name: str, key_field: str, key_value: Any,
                 if import_mode in ("upsert", "create_only"):
                     ins_sql = """
                         INSERT INTO entity
-                            (`uuid`,`sid`,`type`,`name`,`data`,`del`,`input_date`,`update_date`)
+                            (uuid,sid,type,name,data,del,input_date,update_date)
                         VALUES
                             (%s,%s,%s,%s,%s,%s,%s,%s)
                     """
@@ -784,15 +805,15 @@ def _upsert_entity_row(type_name: str, key_field: str, key_value: Any,
         conn.close()
 
 def upsert_entity(type_name: str, key_field: str, key_value: Any, name: str, data_json: str):
-    conn = pymysql.connect(**MYSQL_CFG)
+    conn = get_conn()
     try:
         with conn.cursor() as cur:
             # 1) 查是否已存在同一 fund
-            sql_sel = """
+            sql_sel = f"""
                 SELECT uuid FROM entity
-                WHERE type=%s AND JSON_UNQUOTE(JSON_EXTRACT(data, %s))=%s LIMIT 1
+                WHERE type=%s AND {json_equals_clause('data', key_field)} LIMIT 1
             """
-            cur.execute(sql_sel, (type_name, f"$.{key_field}", key_value))
+            cur.execute(sql_sel, (type_name, str(key_value)))
             row = cur.fetchone()
 
             now_ts = int(time.time())
@@ -822,12 +843,15 @@ def upsert_entity(type_name: str, key_field: str, key_value: Any, name: str, dat
         conn.close()
 
 # =============== 对外：状态 / 入库 / 删除 ===============
-def check_entity_status(type_name: str) -> int:
-    """返回该 type 在 entity 的记录数"""
-    conn = pymysql.connect(**MYSQL_CFG)
+def check_entity_status(type_name: str, sid: Optional[str] = None) -> int:
+    """返回该 type 在 entity 的记录数；若传入 sid 则按 sid 过滤"""
+    conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM entity WHERE type=%s", (type_name,))
+            if sid:
+                cur.execute("SELECT COUNT(*) FROM entity WHERE type=%s AND sid=%s", (type_name, sid))
+            else:
+                cur.execute("SELECT COUNT(*) FROM entity WHERE type=%s", (type_name,))
             n = cur.fetchone()[0]
             return int(n or 0)
     except Exception as e:
@@ -934,7 +958,7 @@ def import_table_data(source_table: str, sid: str = None, target_entity_spec: Op
 
 def delete_table_data(type_name: str, sid: Optional[str] = None) -> int:
     """从 entity 物理删除该 type（按当前 sid 限制）"""
-    conn = pymysql.connect(**MYSQL_CFG)
+    conn = get_conn()
     try:
         with conn.cursor() as cur:
             # 若未显式传入，回退到全局 SID
