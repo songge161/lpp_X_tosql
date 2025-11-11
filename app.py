@@ -564,16 +564,42 @@ def render_mapped_tables():
     # 顶部批量操作
     c1, c2, c3 = st.columns([1,1,6])
     with c1:
+        # 批量入库方式选择
+        bulk_mode_label_to_val = {
+            "创建更新": "upsert",
+            "仅更新": "update_only",
+            "仅创建": "create_only",
+        }
+        bulk_mode = st.selectbox(
+            "入库方式",
+            options=list(bulk_mode_label_to_val.keys()),
+            index=0,
+            key="bulk_import_mode"
+        )
         if st.button("一键入库（全部）", type="primary"):
-            total = 0
-            for r in rows:
-                total += import_table_data(r["source_table"], sid=SID)
-            st.success(f"✅ 完成入库，总计写入 {total} 条。")
+            total_written = 0
+            overall = st.progress(0)
+            info = st.empty()
+            total_tables = len(rows)
+            for i, r in enumerate(rows, start=1):
+                # 可选：每个表内部的进度（显示在 info 文本中）
+                last_inner = {"cur": 0, "tot": 0}
+                def _inner_cb(cur, tot):
+                    last_inner["cur"], last_inner["tot"] = cur, tot
+                    info.write(f"正在入库 {r['source_table']}（{cur}/{tot}）...")
+                total_written += import_table_data(
+                    r["source_table"], sid=SID,
+                    target_entity_spec=r["target_entity"],
+                    import_mode=bulk_mode_label_to_val.get(bulk_mode, "upsert"),
+                    progress_cb=_inner_cb
+                )
+                overall.progress(int(i * 100 / max(total_tables, 1)))
+            st.success(f"✅ 完成入库（{bulk_mode}），总计写入 {total_written} 条。")
     with c2:
         if st.button("一键删除（全部）"):
             total_del = 0
             for r in rows:
-                total_del += delete_table_data(r["target_entity"])
+                total_del += delete_table_data(r["target_entity"]) 
             st.success(f"🗑 已删除 {total_del} 条（按 type 汇总）。")
 
     st.markdown("---")
@@ -596,7 +622,7 @@ def render_mapped_tables():
         count = check_entity_status(tgt)
         status = "✅ 已入库" if count > 0 else "❌ 未入库"
 
-        cols = st.columns([3, 3, 3, 1, 1, 2])
+        cols = st.columns([3, 3, 3, 1, 1, 3])
         cols[0].text(disp_name)
         # 跳转时携带 entity 参数，直达该目标的详情页（新标签页打开）
         cols[1].markdown(
@@ -608,12 +634,37 @@ def render_mapped_tables():
         cols[4].text(str(pri))
 
         with cols[5]:
+            # 行级入库方式选择 + 操作按钮
+            mode_label_to_val = {
+                "创建更新": "upsert",
+                "仅更新": "update_only",
+                "仅创建": "create_only",
+            }
+            row_mode_label = st.selectbox(
+                "入库方式",
+                options=list(mode_label_to_val.keys()),
+                index=0,
+                key=f"mode_{src}_{tgt}"
+            )
             b1, b2 = st.columns([1,1])
             with b1:
                 if st.button("入库", key=f"imp_{src}_{tgt}"):
+                    # 行级进度条
+                    prog = st.progress(0)
+                    txt = st.empty()
+                    def _cb(cur, tot):
+                        pct = int(cur * 100 / max(tot, 1))
+                        prog.progress(pct)
+                        txt.write(f"进度：{cur}/{tot}")
                     # 显式传入本行的 target_entity，避免多映射时混淆
-                    n = import_table_data(src, sid=SID, target_entity_spec=tgt)
-                    st.success(f"入库完成：写入 {n} 条")
+                    n = import_table_data(
+                        src,
+                        sid=SID,
+                        target_entity_spec=tgt,
+                        import_mode=mode_label_to_val.get(row_mode_label, "upsert"),
+                        progress_cb=_cb
+                    )
+                    st.success(f"入库完成（{row_mode_label}）：写入 {n} 条")
                     st.rerun()
             with b2:
                 if st.button("删除", key=f"del_{src}_{tgt}"):

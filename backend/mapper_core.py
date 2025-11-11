@@ -1,6 +1,6 @@
 # backend/mapper_core.py
 # -*- coding: utf-8 -*-
-from typing import Dict, Any, Tuple, Optional, List
+from typing import Dict, Any, Tuple, Optional, List, Callable
 import re, pymysql, json, time,math, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -640,16 +640,44 @@ def insert_entities(rows: List[Tuple[str,str,str,str,str,int,int,int]]):
         return 0
     finally:
         conn.close()
-# ========== NEW: 解析 type(key) ==========
-def _parse_type_and_key(type_spec: str) -> Tuple[str, str]:
+# ========== NEW: 解析 type(key)[excludes] ==========
+def _parse_type_and_key(type_spec: str) -> Tuple[str, str, List[str]]:
     """
-    把 'fund(id)' 解析为 ('fund', 'id')；若无 () 则默认 key='id'
+    支持如下形式：
+      - 'fund'                     -> (type='fund', key='id', excludes=[])
+      - 'fund(usci)'               -> (type='fund', key='usci', excludes=[])
+      - 'fund(usci)[data.id,name]' -> (type='fund', key='usci', excludes=['data.id','name'])
+    [] 中的排除项以逗号分隔；'name' 表示排除顶层实体 name；'data.X' 表示排除 data JSON 中的字段（支持 a.b.c 路径）。
     """
     s = (type_spec or "").strip()
-    if "(" in s and s.endswith(")"):
-        t, k = s.split("(", 1)
-        return t.strip(), k[:-1].strip() or "id"
-    return s, "id"
+    m = re.match(r"^(?P<typ>\w+)(?:\((?P<key>[\w\.]+)\))?(?:\[(?P<excl>[^\]]+)\])?$", s)
+    if not m:
+        return s, "id", []
+    t = (m.group("typ") or "").strip()
+    k = (m.group("key") or "id").strip()
+    excl_raw = (m.group("excl") or "").strip()
+    excludes: List[str] = []
+    if excl_raw:
+        excludes = [x.strip() for x in excl_raw.split(",") if x.strip()]
+    return t, k, excludes
+
+def _del_by_path(obj: Dict[str, Any], path: str):
+    """从字典 obj 中删除路径 path（例如 'a.b.c'），若不存在则忽略。"""
+    if not path:
+        return
+    parts = path.split(".")
+    cur = obj
+    for p in parts[:-1]:
+        if not isinstance(cur, dict):
+            return
+        if p not in cur:
+            return
+        cur = cur[p]
+    if isinstance(cur, dict) and parts[-1] in cur:
+        try:
+            del cur[parts[-1]]
+        except Exception:
+            pass
 
 
 # ========== NEW: 抽取顶层 meta（并从 data JSON 中剔除这些 meta）==========
@@ -669,7 +697,7 @@ def _extract_entity_meta(mapped: Dict[str, Any], now_ts: int) -> Dict[str, int]:
 # ========== NEW: 单条 UPSERT 到 entity ==========
 def _upsert_entity_row(type_name: str, key_field: str, key_value: Any,
                        sid: str, name_val: str, data_json: str,
-                       meta: Dict[str, int]) -> int:
+                       meta: Dict[str, int], import_mode: str = "upsert") -> int:
     """
     使用 (type_name, JSON_EXTRACT(data, $.<key_field>)=key_value) 实现 UPSERT。
     命中则 UPDATE：name、data、update_date；未命中则 INSERT。
@@ -684,39 +712,67 @@ def _upsert_entity_row(type_name: str, key_field: str, key_value: Any,
         with conn.cursor() as cur:
             # 查询是否已存在该唯一键
             sel_sql = """
-                SELECT uuid FROM entity
+                SELECT uuid, name, data FROM entity
                 WHERE type=%s AND JSON_UNQUOTE(JSON_EXTRACT(data, %s))=%s
                 LIMIT 1
             """
             cur.execute(sel_sql, (type_name, f"$.{key_field}", str(key_value)))
             row = cur.fetchone()
 
-            if row:  # 命中 → UPDATE
-                uuid = row[0]
-                upd_sql = """
-                    UPDATE entity
-                    SET name=%s,
-                        data=%s,
-                        `del`=%s,
-                        update_date=%s
-                    WHERE uuid=%s
-                """
-                cur.execute(
-                    upd_sql,
-                    (name_val, data_json, int(meta["del"]), int(meta["update_date"]), uuid)
-                )
-            else:    # 未命中 → INSERT
-                ins_sql = """
-                    INSERT INTO entity
-                        (`uuid`,`sid`,`type`,`name`,`data`,`del`,`input_date`,`update_date`)
-                    VALUES
-                        (%s,%s,%s,%s,%s,%s,%s,%s)
-                """
-                cur.execute(
-                    ins_sql,
-                    (_make_uuid10(), sid, type_name, name_val, data_json,
-                     int(meta["del"]), int(meta["input_date"]), int(meta["update_date"]))
-                )
+            if row:  # 命中
+                uuid, old_name, old_data_json = row[0], row[1], row[2]
+                # 合并策略：当 import_mode 为 upsert 或 update_only 时也使用合并，避免覆盖丢字段
+                # 旧数据解析失败则回退为替换
+                merged_json = data_json
+                try:
+                    old_data = json.loads(old_data_json or "{}")
+                    new_data = json.loads(data_json or "{}")
+                    def deep_merge(a, b):
+                        for k, v in b.items():
+                            if isinstance(v, dict) and isinstance(a.get(k), dict):
+                                deep_merge(a[k], v)
+                            else:
+                                a[k] = v
+                        return a
+                    merged = deep_merge(old_data, new_data)
+                    merged_json = json.dumps(merged, ensure_ascii=False)
+                except Exception:
+                    merged_json = data_json
+
+                if import_mode in ("upsert", "update_only", "upsert_merge", "update_merge"):
+                    # 若 name 为空字符串，则保留旧 name
+                    final_name = old_name if (name_val is None or str(name_val) == "") else name_val
+                    upd_sql = """
+                        UPDATE entity
+                        SET name=%s,
+                            data=%s,
+                            `del`=%s,
+                            update_date=%s
+                        WHERE uuid=%s
+                    """
+                    cur.execute(
+                        upd_sql,
+                        (final_name, merged_json, int(meta["del"]), int(meta["update_date"]), uuid)
+                    )
+                else:
+                    # create_only 命中则不写
+                    return 0
+            else:    # 未命中
+                if import_mode in ("upsert", "create_only"):
+                    ins_sql = """
+                        INSERT INTO entity
+                            (`uuid`,`sid`,`type`,`name`,`data`,`del`,`input_date`,`update_date`)
+                        VALUES
+                            (%s,%s,%s,%s,%s,%s,%s,%s)
+                    """
+                    cur.execute(
+                        ins_sql,
+                        (_make_uuid10(), sid, type_name, name_val, data_json,
+                         int(meta["del"]), int(meta["input_date"]), int(meta["update_date"]))
+                    )
+                else:
+                    # update_only 未命中则不写
+                    return 0
 
         conn.commit()
         return 1
@@ -780,7 +836,7 @@ def check_entity_status(type_name: str) -> int:
     finally:
         conn.close()
 
-def import_table_data(source_table: str, sid: str = None, target_entity_spec: Optional[str] = None) -> int:
+def import_table_data(source_table: str, sid: str = None, target_entity_spec: Optional[str] = None, import_mode: str = "upsert", progress_cb: Optional[Callable[[int, int], None]] = None) -> int:
     """
     读取 source/sql/<table>.sql 的所有 INSERT，映射后按 (type(key)) 规则 UPSERT 入库。
     - target_entity 支持 'fund' 或 'fund(id)'；后者表示统一主键是 data.id。
@@ -799,14 +855,18 @@ def import_table_data(source_table: str, sid: str = None, target_entity_spec: Op
         print(f"[import_table_data] No INSERT values in {sql_path.name}")
         return 0
 
-    # ⭐ 支持外部指定目标类型（如 'fund' 或 'fund(id)'）
+    # ⭐ 支持外部指定目标类型与排除（如 'fund'、'fund(id)'、'fund(usci)[data.id,name]'）
     target_type_spec = (target_entity_spec or get_target_entity(source_table) or source_table)
-    final_type, key_field = _parse_type_and_key(target_type_spec)
+    final_type, key_field, excludes = _parse_type_and_key(target_type_spec)
 
     now_ts = int(time.time())
     wrote = 0
+    total = len(records)
+    # 进度回调节流：最多 ~100 次更新，且保证最后一次更新
+    stride = 1 if total <= 100 else max(1, total // 100)
+    last_cb_ts = 0.0
 
-    for rec in records:
+    for idx, rec in enumerate(records, start=1):
         # 1) 映射：按当前 final_type 过滤字段映射 & 脚本上下文
         mapped_data, out_name, type_override = apply_record_mapping(
             source_table, rec, py_script="", target_entity=final_type
@@ -818,20 +878,37 @@ def import_table_data(source_table: str, sid: str = None, target_entity_spec: Op
         if key_val in (None, ""):
             key_val = rec.get(key_field, "")
 
-        # 3) 确保该统一键被写入 data JSON
+        # 3) 应用排除：删除指定的 data.* 字段；'name' 排除则不写顶层 name
+        name_excluded = False
+        for ex in excludes:
+            if ex == "name":
+                name_excluded = True
+            elif ex.startswith("data."):
+                p = ex[5:].strip()
+                if p and p != key_field:
+                    _del_by_path(mapped_data, p)
+
+        # 4) 确保该统一键被写入 data JSON
         if key_field not in mapped_data:
             mapped_data[key_field] = key_val
 
-        # 4) 元字段抽取（并从 data JSON 剔除）
+        # 5) 元字段抽取（并从 data JSON 剔除）
         meta = _extract_entity_meta(mapped_data, now_ts=now_ts)
 
-        # 5) name 取 mapped_data['__name__'] 回落 out_name
+        # 6) name 取 mapped_data['__name__'] 回落 out_name；若排除 name 则置空
         name_val = (mapped_data.get("__name__") or out_name or "").strip()
+        if name_excluded:
+            name_val = ""
+            if "__name__" in mapped_data:
+                try:
+                    del mapped_data["__name__"]
+                except Exception:
+                    pass
 
-        # 6) 序列化 data（此时已不包含 del/input_date/update_date）
+        # 7) 序列化 data（此时已不包含 del/input_date/update_date）
         data_json = json.dumps(mapped_data, ensure_ascii=False)
 
-        # 7) UPSERT
+        # 8) UPSERT
         wrote += _upsert_entity_row(
             type_name=type_here,
             key_field=key_field,
@@ -839,8 +916,19 @@ def import_table_data(source_table: str, sid: str = None, target_entity_spec: Op
             sid=sid,
             name_val=name_val,
             data_json=data_json,
-            meta=meta
+            meta=meta,
+            import_mode=import_mode
         )
+        # 9) 进度回调（每处理一条记录）
+        try:
+            if progress_cb:
+                now = time.time()
+                if (idx == total) or (idx % stride == 0) or (now - last_cb_ts >= 0.05):
+                    progress_cb(idx, total)
+                    last_cb_ts = now
+        except Exception:
+            # 回调失败不影响主流程
+            pass
 
     return wrote
 
