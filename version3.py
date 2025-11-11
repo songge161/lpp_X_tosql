@@ -268,11 +268,11 @@ def handle_deleted_tables(del_arr: List[str], mode="logical"):
     with conn.cursor() as cur:
         for t in del_arr:
             if mode == "logical":
-                cur.execute("UPDATE entity SET del=1 WHERE type=%s", (t,))
-                log(f"🟡 表 {t} 已逻辑删除")
+                cur.execute("UPDATE entity SET del=1 WHERE type=%s AND sid=%s", (t, SID))
+                log(f"🟡 表 {t} 已逻辑删除（sid={SID}）")
             else:
-                cur.execute("DELETE FROM entity WHERE type=%s", (t,))
-                log(f"🗑️ 表 {t} 已物理删除")
+                cur.execute("DELETE FROM entity WHERE type=%s AND sid=%s", (t, SID))
+                log(f"🗑️ 表 {t} 已物理删除（sid={SID}）")
         conn.commit()
     conn.close()
 

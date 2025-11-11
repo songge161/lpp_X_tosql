@@ -932,14 +932,16 @@ def import_table_data(source_table: str, sid: str = None, target_entity_spec: Op
 
     return wrote
 
-def delete_table_data(type_name: str) -> int:
-    """从 entity 物理删除该 type"""
+def delete_table_data(type_name: str, sid: Optional[str] = None) -> int:
+    """从 entity 物理删除该 type（按当前 sid 限制）"""
     conn = pymysql.connect(**MYSQL_CFG)
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM entity WHERE type=%s", (type_name,))
+            # 若未显式传入，回退到全局 SID
+            cur_sid = sid or SID
+            cur.execute("SELECT COUNT(*) FROM entity WHERE type=%s AND sid=%s", (type_name, cur_sid))
             n = int(cur.fetchone()[0] or 0)
-            cur.execute("DELETE FROM entity WHERE type=%s", (type_name,))
+            cur.execute("DELETE FROM entity WHERE type=%s AND sid=%s", (type_name, cur_sid))
         conn.commit()
         return n
     except Exception as e:

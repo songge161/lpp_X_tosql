@@ -577,29 +577,15 @@ def render_mapped_tables():
             key="bulk_import_mode"
         )
         if st.button("一键入库（全部）", type="primary"):
-            total_written = 0
-            overall = st.progress(0)
-            info = st.empty()
-            total_tables = len(rows)
-            for i, r in enumerate(rows, start=1):
-                # 可选：每个表内部的进度（显示在 info 文本中）
-                last_inner = {"cur": 0, "tot": 0}
-                def _inner_cb(cur, tot):
-                    last_inner["cur"], last_inner["tot"] = cur, tot
-                    info.write(f"正在入库 {r['source_table']}（{cur}/{tot}）...")
-                total_written += import_table_data(
-                    r["source_table"], sid=SID,
-                    target_entity_spec=r["target_entity"],
-                    import_mode=bulk_mode_label_to_val.get(bulk_mode, "upsert"),
-                    progress_cb=_inner_cb
-                )
-                overall.progress(int(i * 100 / max(total_tables, 1)))
-            st.success(f"✅ 完成入库（{bulk_mode}），总计写入 {total_written} 条。")
+            total = 0
+            for r in rows:
+                total += import_table_data(r["source_table"], sid=SID, target_entity_spec=r["target_entity"], import_mode=bulk_mode_label_to_val.get(bulk_mode, "upsert"))
+            st.success(f"✅ 完成入库（{bulk_mode}），总计写入 {total} 条。")
     with c2:
         if st.button("一键删除（全部）"):
             total_del = 0
             for r in rows:
-                total_del += delete_table_data(r["target_entity"]) 
+                total_del += delete_table_data(r["target_entity"], sid=SID) 
             st.success(f"🗑 已删除 {total_del} 条（按 type 汇总）。")
 
     st.markdown("---")
@@ -649,26 +635,18 @@ def render_mapped_tables():
             b1, b2 = st.columns([1,1])
             with b1:
                 if st.button("入库", key=f"imp_{src}_{tgt}"):
-                    # 行级进度条
-                    prog = st.progress(0)
-                    txt = st.empty()
-                    def _cb(cur, tot):
-                        pct = int(cur * 100 / max(tot, 1))
-                        prog.progress(pct)
-                        txt.write(f"进度：{cur}/{tot}")
                     # 显式传入本行的 target_entity，避免多映射时混淆
                     n = import_table_data(
                         src,
                         sid=SID,
                         target_entity_spec=tgt,
-                        import_mode=mode_label_to_val.get(row_mode_label, "upsert"),
-                        progress_cb=_cb
+                        import_mode=mode_label_to_val.get(row_mode_label, "upsert")
                     )
                     st.success(f"入库完成（{row_mode_label}）：写入 {n} 条")
                     st.rerun()
             with b2:
                 if st.button("删除", key=f"del_{src}_{tgt}"):
-                    n = delete_table_data(tgt)
+                    n = delete_table_data(tgt, sid=SID)
                     st.success(f"删除完成：清理 {n} 条")
                     st.rerun()
 
