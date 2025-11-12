@@ -4,6 +4,7 @@ import json
 import re
 from pathlib import Path
 import streamlit as st
+import time
 
 # 顶部 import 部分
 from backend.db import (
@@ -776,13 +777,38 @@ def render_mapped_tables():
         )
         if st.button("一键入库（全部）", type="primary"):
             total = 0
+            progress_placeholder = st.empty()
             for r in rows:
+                table = r["source_table"]
+                start_ts = time.time()
+                with progress_placeholder:
+                    bar = st.progress(0, text=f"正在入库：{table}")
+                def _fmt_eta(s):
+                    try:
+                        s = int(s)
+                    except Exception:
+                        s = 0
+                    if s >= 3600:
+                        h = s // 3600
+                        m = (s % 3600) // 60
+                        return f"{h}小时{m}分"
+                    m = s // 60
+                    sec = s % 60
+                    return f"{m:02d}:{sec:02d}"
+                def _cb(done, all):
+                    all = max(all, 1)
+                    pct = int(done * 100 / all)
+                    elapsed = max(time.time() - start_ts, 0.001)
+                    eta = int((all - done) * (elapsed / max(done, 1)))
+                    bar.progress(pct, text=f"正在入库：{table}（{done}/{all}，预计剩余 {_fmt_eta(eta)}）")
                 total += import_table_data(
-                    r["source_table"],
+                    table,
                     sid=st.session_state.get("current_sid", SID),
                     target_entity_spec=r["target_entity"],
-                    import_mode=bulk_mode_label_to_val.get(bulk_mode, "upsert")
+                    import_mode=bulk_mode_label_to_val.get(bulk_mode, "upsert"),
+                    progress_cb=_cb
                 )
+            progress_placeholder.empty()
             st.success(f"✅ 完成入库（{bulk_mode}），总计写入 {total} 条。")
     with c2:
         if st.button("一键删除（全部）"):
@@ -838,13 +864,35 @@ def render_mapped_tables():
             b1, b2 = st.columns([1,1])
             with b1:
                 if st.button("入库", key=f"imp_{src}_{tgt}"):
-                    # 显式传入本行的 target_entity，避免多映射时混淆
+                    progress_placeholder = st.empty()
+                    start_ts = time.time()
+                    bar = progress_placeholder.progress(0, text=f"正在入库：{src} → {tgt}")
+                    def _fmt_eta(s):
+                        try:
+                            s = int(s)
+                        except Exception:
+                            s = 0
+                        if s >= 3600:
+                            h = s // 3600
+                            m = (s % 3600) // 60
+                            return f"{h}小时{m}分"
+                        m = s // 60
+                        sec = s % 60
+                        return f"{m:02d}:{sec:02d}"
+                    def _cb(done, all):
+                        all = max(all, 1)
+                        pct = int(done * 100 / all)
+                        elapsed = max(time.time() - start_ts, 0.001)
+                        eta = int((all - done) * (elapsed / max(done, 1)))
+                        bar.progress(pct, text=f"正在入库：{src} → {tgt}（{done}/{all}，预计剩余 {_fmt_eta(eta)}）")
                     n = import_table_data(
                         src,
                         sid=st.session_state.get("current_sid", SID),
                         target_entity_spec=tgt,
-                        import_mode=mode_label_to_val.get(row_mode_label, "upsert")
+                        import_mode=mode_label_to_val.get(row_mode_label, "upsert"),
+                        progress_cb=_cb
                     )
+                    progress_placeholder.empty()
                     st.success(f"入库完成（{row_mode_label}）：写入 {n} 条")
                     st.rerun()
             with b2:
