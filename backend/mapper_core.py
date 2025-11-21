@@ -22,6 +22,9 @@ class SafeRecord(SimpleNamespace):
         return getattr(self, key, default)
 
 _CACHE: Dict[str, Any] = {}
+# 专用于 SQL 源文件解析的缓存（不随每条映射清空）
+_SQL_ROWS_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+_SQL_IDX_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
 COMPLEX_EXPR_RE = re.compile(
     r"(?P<etype>(entity|sql))\.(?P<table>\w+)\(\s*(?P<cond>.+?)\s*\)\.(?P<target>[\w\.]+)",
@@ -52,7 +55,9 @@ def _eval_complex_expr(expr: str, record: Dict[str, Any]) -> Optional[Any]:
         return None
 
     where_field = left.split(".")[-1].replace("data.", "")
-    # ✅ 无论是 entity 还是 sql，都统一使用 entity_fetch
+    # 根据前缀分流：entity -> 查询实体表；sql -> 查源 SQL 文件
+    if etype == "sql":
+        return _sql_lookup(table, where_field, right_val, target)
     return _entity_fetch(table, where_field, right_val, target)
 # ==================== 🔧 SQL 直接查询补丁 ====================
 
@@ -241,6 +246,104 @@ def _entity_rel_fetch(type_name: str, entity_id: Any, field: str = "uuid") -> Op
     finally:
         conn.close()
     return None
+
+# ================= 源 SQL 查找（用于 sql.xxx(...)） =================
+def _sql_lookup(table: str, where_field: str, where_val: Any, target_field: str) -> Optional[Any]:
+    """在 source/sql/<table>.sql 中按列匹配并返回目标列值。
+    - 解析 INSERT 语句得到行列表；简单扫描匹配 where_field==where_val；返回 target_field
+    - 若文件不存在或未命中，返回 None
+    - 使用进程级缓存避免重复解析
+    """
+    try:
+        wf = str(where_field or "").replace("data.", "").strip()
+        tf = str(target_field or "").strip()
+        tv = str(where_val or "").strip()
+
+        # 取 rows 缓存（不受 _CACHE.clear() 影响）
+        rows = _SQL_ROWS_CACHE.get(table)
+        if rows is None:
+            p = detect_sql_path(table)
+            if not p.exists():
+                return None
+            rows = _parse_sql_file(p)
+            _SQL_ROWS_CACHE[table] = rows
+
+        # 若该字段未建立索引，构建一次基于小写、去空格的索引
+        idx_key = f"{table}|{wf}"
+        idx = _SQL_IDX_CACHE.get(idx_key)
+        if idx is None:
+            idx = {}
+            for r in rows:
+                rv = str(r.get(wf, "")).strip().lower()
+                if rv:
+                    # 若存在重复键，保留第一条；如需最新策略可另加逻辑
+                    idx.setdefault(rv, r)
+            _SQL_IDX_CACHE[idx_key] = idx
+
+        hit = idx.get(tv.strip().lower())
+        if not hit:
+            return None
+        val = hit.get(tf, None)
+        if val in (None, "", "NULL", "null"):
+            return None
+        return val
+    except Exception as e:
+        print("[_sql_lookup error]", e)
+        return None
+
+# ========== 对外：SQL 缓存管理 ==========
+def clear_sql_cache(table: Optional[str] = None) -> Dict[str, int]:
+    """清理 SQL 解析与索引缓存。table 为空则清理全部。返回统计信息。"""
+    cleared_rows = 0
+    cleared_idx = 0
+    if table:
+        if table in _SQL_ROWS_CACHE:
+            del _SQL_ROWS_CACHE[table]
+            cleared_rows = 1
+        # 删除该表的所有字段索引
+        keys = [k for k in _SQL_IDX_CACHE.keys() if k.startswith(f"{table}|")]
+        for k in keys:
+            del _SQL_IDX_CACHE[k]
+            cleared_idx += 1
+    else:
+        cleared_rows = len(_SQL_ROWS_CACHE)
+        cleared_idx = len(_SQL_IDX_CACHE)
+        _SQL_ROWS_CACHE.clear()
+        _SQL_IDX_CACHE.clear()
+    return {"rows": cleared_rows, "idx": cleared_idx}
+
+def warm_sql_cache(tables: List[str]) -> Dict[str, int]:
+    """预热指定表的 SQL 解析与索引缓存。返回成功预热的表数量和索引数量。"""
+    warmed_rows = 0
+    warmed_idx = 0
+    for tbl in tables or []:
+        try:
+            p = detect_sql_path(tbl)
+            if not p.exists():
+                continue
+            rows = _SQL_ROWS_CACHE.get(tbl)
+            if rows is None:
+                rows = _parse_sql_file(p)
+                _SQL_ROWS_CACHE[tbl] = rows
+                warmed_rows += 1
+            # 为每个字段建立一次索引（按需可限制字段集合）
+            if rows:
+                # 按首条记录的键集合建立索引，避免全表所有列带来过多索引
+                sample_keys = list(rows[0].keys())
+                for wf in sample_keys:
+                    idx_key = f"{tbl}|{wf}"
+                    if idx_key in _SQL_IDX_CACHE:
+                        continue
+                    idx = {}
+                    for r in rows:
+                        rv = str(r.get(wf, "")).strip().lower()
+                        if rv:
+                            idx.setdefault(rv, r)
+                    _SQL_IDX_CACHE[idx_key] = idx
+                    warmed_idx += 1
+        except Exception:
+            continue
+    return {"rows": warmed_rows, "idx": warmed_idx}
 
 
 # ================= Python 安全求值（py:{...}） =================

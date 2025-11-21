@@ -16,7 +16,7 @@ from backend.db import (
     rename_table_target_entity  # 新增：原子重命名
 )
 from backend.source_fields import detect_source_fields, detect_sql_path,detect_field_comments, detect_table_title
-from backend.mapper_core import apply_record_mapping, check_entity_status, import_table_data, delete_table_data
+from backend.mapper_core import apply_record_mapping, check_entity_status, import_table_data, delete_table_data, clear_sql_cache
 from backend.sql_utils import update_runtime_db, current_cfg
 from backend.presets import init_presets_db, list_presets, save_preset, delete_preset, get_last_runtime, save_last_runtime
 
@@ -45,7 +45,6 @@ if "db_cfg" not in st.session_state:
     }
 if "current_sid" not in st.session_state:
     st.session_state.current_sid = SID
-
 # 启动时尝试恢复最近一次应用的运行时配置
 _last = get_last_runtime()
 if _last:
@@ -468,6 +467,17 @@ def render_table_detail(table_name: str):
                 st.warning("当前 entity 未创建映射，请到『🧩 多映射管理中心』创建目标实体")
 
     st.markdown("---")
+
+    st.subheader("SQL 缓存")
+    ccols = st.columns([3, 1, 6])
+    with ccols[0]:
+        cache_tbl = st.text_input("表名（留空清理全部）", key=f"cache_tbl_{table_name}")
+    with ccols[1]:
+        if st.button("清理一次", key=f"clear_sql_cache_{table_name}"):
+            tbl = (cache_tbl or "").strip() or None
+            info = clear_sql_cache(tbl)
+            st.success(f"已清理：rows={info.get('rows',0)}, idx={info.get('idx',0)}")
+            st.rerun()
 
     # 字段映射（压缩行 + 单行保存 + 一键保存）
     st.markdown("<div id=\"sec-mapping\"></div>", unsafe_allow_html=True)
