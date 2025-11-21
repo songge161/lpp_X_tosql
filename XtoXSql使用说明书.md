@@ -29,18 +29,18 @@ streamlit run app.py
 
 ​	管理基本的映射内容
 
-![image-20251121171746708](/Users/songyihong/Library/Application Support/typora-user-images/image-20251121171746708.png)
+![image-20251121171746708](/static/assets/image-20251121171746708.png)
 
 
 
 ### 2 详细配置界面
 
-- 表配置（管理表的映射entity的type和优先级，保证入库顺序和入库目标）![image-20251121173256885](/Users/songyihong/Library/Application Support/typora-user-images/image-20251121173256885.png)
-- 表级脚本（当rule无法生效时，此为最后的解决方案，支持基本的py语法）![image-20251121173312085](/Users/songyihong/Library/Application Support/typora-user-images/image-20251121173312085.png)
-- 字段映射（最核心的功能，包括映射源、映射目标、映射规则，辅助信息非常详细，*rule*相关内容见3）![image-20251121173330982](/Users/songyihong/Library/Application Support/typora-user-images/image-20251121173330982.png)
-- 新增映射（为额外字段提供支持，可以辅助实现数值条件等计算后映射）![image-20251121173343037](/Users/songyihong/Library/Application Support/typora-user-images/image-20251121173343037.png)
-- 模拟打印（从源数据拉取一条或者多条进行打印模拟映射后的结果，支持多条件筛选后获取这个模拟数据，解决需要看特殊条件的需求）![image-20251121173406604](/Users/songyihong/Library/Application Support/typora-user-images/image-20251121173406604.png)
-- 字段专注（对指定输出字段进行打印，支持大批量打印，直观看出目前的数据）![image-20251121173440534](/Users/songyihong/Library/Application Support/typora-user-images/image-20251121173440534.png)
+- 表配置（管理表的映射entity的type和优先级，保证入库顺序和入库目标）![image-20251121173256885](/static/assets/image-20251121173256885.png)
+- 表级脚本（当rule无法生效时，此为最后的解决方案，支持基本的py语法）![image-20251121173312085](/static/assets/image-20251121173312085.png)
+- 字段映射（最核心的功能，包括映射源、映射目标、映射规则，辅助信息非常详细，*rule*相关内容见3）![image-20251121173330982](/static/assets/image-20251121173330982.png)
+- 新增映射（为额外字段提供支持，可以辅助实现数值条件等计算后映射）![image-20251121173343037](/static/assets/image-20251121173343037.png)
+- 模拟打印（从源数据拉取一条或者多条进行打印模拟映射后的结果，支持多条件筛选后获取这个模拟数据，解决需要看特殊条件的需求）![image-20251121173406604](/static/assets/image-20251121173406604.png)
+- 字段专注（对指定输出字段进行打印，支持大批量打印，直观看出目前的数据）![image-20251121173440534](/static/assets/image-20251121173440534.png)
 
 ### 3 映射结构管理
 
@@ -50,19 +50,19 @@ streamlit run app.py
 - 条件入库（插入，更新，更新插入）
 - 状态查看
 
-![image-20251121172649868](/Users/songyihong/Library/Application Support/typora-user-images/image-20251121172649868.png)
+![image-20251121172649868](/static/assets/image-20251121172649868.png)
 
 ### 4 多映射管理中心
 
 ​	解决单个表需要映射到多个目标上或者多个表需要映射到单个表的情况，或者更复杂的情况
-![image-20251121172928738](/Users/songyihong/Library/Application Support/typora-user-images/image-20251121172928738.png)
+![image-20251121172928738](/static/assets/image-20251121172928738.png)
 
 ### 5目标库切换
 
 ​	实现对目标库的切换支持，目前支持mysql和pgsql的目标库
 未来将会对源库修改支持（包括本地sql和远程连接库）
 
-![image-20251121173059036](/Users/songyihong/Library/Application Support/typora-user-images/image-20251121173059036.png)
+![image-20251121173059036](/static/assets/image-20251121173059036.png)
 
 ## 3.规则语法（rule）
 
