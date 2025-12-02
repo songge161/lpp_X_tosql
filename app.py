@@ -16,7 +16,7 @@ from backend.db import (
     rename_table_target_entity  # 新增：原子重命名
 )
 from backend.source_fields import detect_source_fields, detect_sql_path,detect_field_comments, detect_table_title
-from backend.mapper_core import apply_record_mapping, check_entity_status, import_table_data, delete_table_data, clear_sql_cache
+from backend.mapper_core import apply_record_mapping, check_entity_status, import_table_data, delete_table_data, clear_sql_cache, _parse_sql_file
 from backend.sql_utils import update_runtime_db, current_cfg
 from backend.presets import init_presets_db, list_presets, save_preset, delete_preset, get_last_runtime, save_last_runtime
 
@@ -197,6 +197,137 @@ with st.sidebar:
 
 
 # ================= 工具函数 =================
+
+def render_top_tabs(active: str):
+    tabs = [
+        ("home", "🏠主页"),
+        ("mapped", "🧩 映射结果管理"),
+        ("multi_mapping", "🧩 多映射管理中心"),
+        ("flow", "🧰 流程管理"),
+        ("file", "📃 文件管理"),
+    ]
+    st.markdown(
+        """
+        <style>
+        .top-tabs { display:flex; gap:8px; flex-wrap: wrap; margin:8px 0 14px; }
+        .top-tabs a { font-size:15px; padding:8px 14px; line-height:1.3; border-radius:8px; border:1px solid #d0d0d0; background:#f7f7f7; text-decoration:none; color:#222; }
+        .top-tabs a.active { background:#264653; color:#fff; border-color:#264653; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    html = ["<div class='top-tabs'>"]
+    for key, label in tabs:
+        is_active = (key == (active or "")) or (key == "home" and (active or "") in ("list", "home"))
+        cls = "active" if is_active else ""
+        target_page = "home" if key == "home" else key
+        html.append(f"<a class='{cls}' href='?page={target_page}'>{label}</a>")
+    html.append("</div>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+# 读取本地 SQL 文件的 INSERT 行
+def _read_sql_rows(table: str):
+    p = detect_sql_path(table)
+    if not p.exists():
+        return []
+    return _parse_sql_file(p)
+
+# 选择字段列用于展示
+def _pick_cols(rows, cols):
+    return [{k: r.get(k, "") for k in cols} for r in rows]
+
+# 综合构建流程实例摘要（基于本地 SQL 文件）
+def _build_instance_rows():
+    hi = _read_sql_rows("act_hi_procinst")
+    ru_task = _read_sql_rows("act_ru_task")
+    ru_exec = _read_sql_rows("act_ru_execution")
+    ru_var  = _read_sql_rows("act_ru_variable")
+    hi_task = _read_sql_rows("act_hi_taskinst")
+    hi_act  = _read_sql_rows("act_hi_actinst")
+    copies  = _read_sql_rows("bpm_process_instance_copy")
+    def_info = _read_sql_rows("bpm_process_definition_info")
+    cats    = _read_sql_rows("bpm_category")
+
+    def _code_of(def_id):
+        s = str(def_id or "")
+        return s.split(":")[0] if ":" in s else s
+
+    # 映射：定义编码 -> 定义信息 / 分类名称
+    def_by_code = {}
+    for d in def_info:
+        c = _code_of(d.get("process_definition_id"))
+        def_by_code.setdefault(c, d)
+    cat_name_by_code = {}
+    for c in cats:
+        cat_name_by_code[str(c.get("code",""))] = c.get("name","")
+
+    from collections import defaultdict
+    def _group(rows, key):
+        g = defaultdict(list)
+        for r in rows:
+            pid = str(r.get(key, "")).strip()
+            if pid:
+                g[pid].append(r)
+        return g
+
+    g_task = _group(ru_task, "proc_inst_id_")
+    g_exec = _group(ru_exec, "proc_inst_id_")
+    g_var  = _group(ru_var,  "proc_inst_id_")
+    g_htask= _group(hi_task, "proc_inst_id_")
+    g_hact = _group(hi_act,  "proc_inst_id_")
+    g_copy = _group(copies,  "process_instance_id")
+
+    rows = []
+    for r in hi:
+        pid = r.get("id_", "")
+        def_id = r.get("proc_def_id_", "")
+        code = _code_of(def_id)
+        di = def_by_code.get(code, {})
+        cat_name = cat_name_by_code.get(code, code)
+
+        tasks = g_task.get(pid, [])
+        execs = g_exec.get(pid, [])
+        vars_ = g_var.get(pid, [])
+        htasks= g_htask.get(pid, [])
+        hacts = g_hact.get(pid, [])
+        cps   = g_copy.get(pid, [])
+
+        open_names = sorted({t.get("name_","") for t in tasks if t.get("name_")})
+        assignees  = sorted({t.get("assignee_","") for t in tasks if t.get("assignee_")})
+        act_ids    = sorted({e.get("act_id_","") for e in execs if e.get("act_id_")})
+
+        # 变量摘要：仅取前 5 个 name_=value
+        def _val(v):
+            return v.get("text_") or v.get("double_") or v.get("long_") or ""
+        var_pairs = [f"{v.get('name_','')}={_val(v)}" for v in vars_ if v.get("name_")]
+        var_summary = ", ".join(var_pairs[:5])
+
+        users = sorted({x.get("user_id") for x in cps if x.get("user_id")})
+
+        rows.append({
+            "proc_inst_id": pid,
+            "proc_def_id": def_id,
+            "def_code": code,
+            "category": cat_name,
+            "business_key": r.get("business_key_",""),
+            "start_time": r.get("start_time_",""),
+            "end_time": r.get("end_time_",""),
+            "open_task_count": len(tasks),
+            "open_task_names": ",".join(open_names),
+            "open_assignees": ",".join(assignees),
+            "current_activities": ",".join(act_ids),
+            "hist_task_count": len(htasks),
+            "hist_act_count": len(hacts),
+            "copy_count": len(cps),
+            "copy_users": ",".join(map(str, users)),
+            "def_desc": di.get("description",""),
+            "form_type": di.get("form_type",""),
+            "form_id": di.get("form_id",""),
+            "vars": var_summary,
+        })
+    # 按开始时间倒序
+    rows.sort(key=lambda x: str(x.get("start_time","")), reverse=True)
+    return rows
 
 # function _ensure_all_fields_seeded(table_name: str, target_entity: str)
 def _ensure_all_fields_seeded(table_name: str, target_entity: str):
@@ -764,6 +895,7 @@ def render_table_detail(table_name: str):
 # ================= 新增：映射结果管理页 =================
 def render_mapped_tables():
     st.title("🧩 映射结果管理")
+    render_top_tabs('mapped')
 
     rows = list_mapped_tables()
     if not rows:
@@ -923,6 +1055,7 @@ def _cached_list_tables():
 
 def render_multi_mapping():
     st.title("🧩 多映射管理中心")
+    render_top_tabs('multi_mapping')
 
     rows = list_mapped_tables()
     if not rows:
@@ -1002,7 +1135,8 @@ def render_multi_mapping():
 
 # ================= 列表页（原有） =================
 def render_table_list():
-    st.title("源表列表")
+    st.title("🏠 主页")
+    render_top_tabs('list')
 
     top = st.columns([1,1,6])
     with top[0]:
@@ -1024,13 +1158,7 @@ def render_table_list():
 
     st.markdown("---")
 
-    # 入口：映射结果管理 / 多映射管理中心（按钮式链接，点击在新标签页打开）
-    cols_nav = st.columns([2, 2, 6])
-    btn_style = "display:inline-block;padding:.5rem 1rem;border-radius:.5rem;border:1px solid #d0d0d0;background:#f6f6f6;text-decoration:none;color:#222;"
-    with cols_nav[0]:
-        st.markdown(f'<a href="?page=mapped" target="_blank" style="{btn_style}">🧩 映射结果管理</a>', unsafe_allow_html=True)
-    with cols_nav[1]:
-        st.markdown(f'<a href="?page=multi_mapping" target="_blank" style="{btn_style}">🧩 多映射管理中心</a>', unsafe_allow_html=True)
+    # 顶部导航已包含所有管理入口，主页继续保留导出/导入功能
 
     st.markdown("---")
 
@@ -1065,6 +1193,255 @@ def render_table_list():
         with col[4]:
             st.text("停用" if dis else "启用")
 
+# ========== 新页面：流程管理 / 文件管理 ==========
+
+def render_flow_mgmt():
+    st.title("🧰 流程管理")
+    render_top_tabs('flow')
+    super_tabs = st.tabs(["表单转换管理", "表单转换入库", "后台数据"])
+
+    with super_tabs[0]:
+        st.subheader("表单转换管理")
+        st.info("管理表单配置与字段映射的转换规则与策略（占位）。")
+
+    with super_tabs[1]:
+        st.subheader("表单转换入库")
+        st.info("将转换后的表单数据批量入库，支持预览与校验（占位）。")
+
+    with super_tabs[2]:
+        tabs = st.tabs(["流程定义", "表单库", "分类", "表达式库", "监听器库", "实例抄送", "用户组", "实例总览", "全部实例", "流程实例（综合）"]) 
+
+        # 流程定义
+        with tabs[0]:
+            kw = st.text_input("关键词（定义ID/模型ID/描述）", key="pd_kw")
+            recs = _parse_all_inserts("bpm_process_definition_info")
+            def _code_of(pd_id: str):
+                s = str(pd_id or "")
+                return s.split(":")[0] if ":" in s else s
+            for r in recs:
+                r["_code"] = _code_of(r.get("process_definition_id"))
+            code = st.text_input("按分类编码过滤（例如 ContractApproval）", key="pd_code")
+            def _match(r):
+                def _has(s):
+                    return (kw or "").strip().lower() in str(s or "").lower()
+                ok_kw = (not kw) or _has(r.get("process_definition_id")) or _has(r.get("model_id")) or _has(r.get("description"))
+                ok_code = (not code) or (str(r.get("_code","")) == code)
+                return ok_kw and ok_code
+            view = [r for r in recs if _match(r)]
+            cols = ["process_definition_id", "model_id", "description", "form_type", "form_id", "_code"]
+            st.dataframe([{k: v for k, v in r.items() if k in cols} for r in view], use_container_width=True)
+
+        # 表单库
+        with tabs[1]:
+            kw = st.text_input("关键词（表单名/备注）", key="form_kw")
+            recs = _parse_all_inserts("bpm_form")
+            def _match(r):
+                s1 = str(r.get("name",""))
+                s2 = str(r.get("remark",""))
+                return (not kw) or (kw.lower() in s1.lower() or kw.lower() in s2.lower())
+            view = [r for r in recs if _match(r)]
+            cols = ["id","name","status","remark"]
+            st.dataframe([{k: v for k, v in r.items() if k in cols} for r in view], use_container_width=True)
+
+        # 分类
+        with tabs[2]:
+            recs = _parse_all_inserts("bpm_category")
+            cols = ["id","name","code","status","sort"]
+            st.dataframe([{k: v for k, v in r.items() if k in cols} for r in recs], use_container_width=True)
+
+        # 表达式库
+        with tabs[3]:
+            kw = st.text_input("关键词（表达式名/内容）", key="expr_kw")
+            recs = _parse_all_inserts("bpm_process_expression")
+            def _match(r):
+                s1 = str(r.get("name",""))
+                s2 = str(r.get("expression",""))
+                return (not kw) or (kw.lower() in s1.lower() or kw.lower() in s2.lower())
+            view = [r for r in recs if _match(r)]
+            cols = ["id","name","status","expression"]
+            st.dataframe([{k: v for k, v in r.items() if k in cols} for r in view], use_container_width=True)
+
+        # 监听器库
+        with tabs[4]:
+            kw = st.text_input("关键词（监听器名/事件/值）", key="lst_kw")
+            recs = _parse_all_inserts("bpm_process_listener")
+            def _match(r):
+                s1 = str(r.get("name",""))
+                s2 = str(r.get("event",""))
+                s3 = str(r.get("value",""))
+                return (not kw) or (kw.lower() in s1.lower() or kw.lower() in s2.lower() or kw.lower() in s3.lower())
+            view = [r for r in recs if _match(r)]
+            cols = ["id","name","type","status","event","value_type","value"]
+            st.dataframe([{k: v for k, v in r.items() if k in cols} for r in view], use_container_width=True)
+
+        # 实例抄送
+        with tabs[5]:
+            kw = st.text_input("关键词（实例ID/任务ID/名称）", key="copy_kw")
+            recs = _parse_all_inserts("bpm_process_instance_copy")
+            def _match(r):
+                s1 = str(r.get("process_instance_id",""))
+                s2 = str(r.get("task_id",""))
+                s3 = str(r.get("task_name",""))
+                return (not kw) or (kw.lower() in s1.lower() or kw.lower() in s2.lower() or kw.lower() in s3.lower())
+            view = [r for r in recs if _match(r)]
+            cols = ["id","user_id","start_user_id","process_instance_id","process_instance_name","task_id","task_name","category"]
+            st.dataframe([{k: v for k, v in r.items() if k in cols} for r in view], use_container_width=True)
+
+        # 用户组
+        with tabs[6]:
+            recs = _parse_all_inserts("bpm_user_group")
+            cols = ["id","name","description","user_ids","status"]
+            st.dataframe([{k: v for k, v in r.items() if k in cols} for r in recs], use_container_width=True)
+
+        # 实例总览（按 process_instance_id 聚合）
+        with tabs[7]:
+            recs = _read_sql_rows("bpm_process_instance_copy")
+            if not recs:
+                st.info("暂无实例数据。")
+            else:
+                from collections import defaultdict
+                groups = defaultdict(list)
+                for r in recs:
+                    pid = str(r.get("process_instance_id","")).strip()
+                    if pid:
+                        groups[pid].append(r)
+                rows = []
+                for pid, items in groups.items():
+                    name = next((x.get("process_instance_name") for x in items if x.get("process_instance_name")), "")
+                    users = sorted({x.get("user_id") for x in items if x.get("user_id")})
+                    starters = sorted({x.get("start_user_id") for x in items if x.get("start_user_id")})
+                    tasks = sorted({x.get("task_id") for x in items if x.get("task_id")})
+                    cats = sorted({x.get("category") for x in items if x.get("category")})
+                    ctimes = [x.get("create_time") for x in items if x.get("create_time")]
+                    utimes = [x.get("update_time") for x in items if x.get("update_time")]
+                    rows.append({
+                        "process_instance_id": pid,
+                        "process_instance_name": name,
+                        "copies": len(items),
+                        "users": ",".join(map(str, users)),
+                        "starters": ",".join(map(str, starters)),
+                        "task_count": len(tasks),
+                        "categories": ",".join(map(str, cats)),
+                        "first_create_time": min(ctimes) if ctimes else "",
+                        "last_update_time": max(utimes) if utimes else "",
+                    })
+                st.dataframe(rows, use_container_width=True)
+
+        # 全部实例（运行时 + 历史）
+        with tabs[8]:
+            st.subheader("历史实例")
+            hi = _read_sql_rows("act_hi_procinst")
+            hist_cols = ["id_","proc_def_id_","start_time_","end_time_","business_key_"]
+            st.dataframe(_pick_cols(hi, hist_cols), use_container_width=True)
+
+            st.subheader("运行时：执行树")
+            ru_exec = _read_sql_rows("act_ru_execution")
+            exec_cols = ["id_","proc_inst_id_","parent_id_","super_exec_","act_id_","is_active_","is_concurrent_","is_scope_"]
+            st.dataframe(_pick_cols(ru_exec, exec_cols), use_container_width=True)
+
+            st.subheader("运行时：任务")
+            ru_task = _read_sql_rows("act_ru_task")
+            task_cols = ["id_","proc_inst_id_","name_","assignee_","owner_","create_time_","due_date_","category_","priority_"]
+            st.dataframe(_pick_cols(ru_task, task_cols), use_container_width=True)
+
+            st.subheader("运行时：变量")
+            ru_var = _read_sql_rows("act_ru_variable")
+            var_cols = ["id_","proc_inst_id_","execution_id_","name_","text_","double_","long_"]
+            st.dataframe(_pick_cols(ru_var, var_cols), use_container_width=True)
+
+        # 流程实例（综合）
+        with tabs[9]:
+            kw = st.text_input("关键词（实例ID/业务键/定义编码）", key="inst_kw")
+            code_filter = st.text_input("按定义编码过滤（如 ContractApproval）", key="inst_code")
+            rows = _build_instance_rows()
+            def _match(r):
+                s = (kw or "").strip().lower()
+                ok_kw = (not s) or s in str(r.get("proc_inst_id","")).lower() or s in str(r.get("business_key","")).lower() or s in str(r.get("def_code","")).lower()
+                ok_code = (not code_filter) or str(r.get("def_code","")) == code_filter
+                return ok_kw and ok_code
+            view = [r for r in rows if _match(r)]
+            cols = [
+                "proc_inst_id","proc_def_id","def_code","category","business_key","start_time","end_time",
+                "open_task_count","open_task_names","open_assignees","current_activities",
+                "hist_task_count","hist_act_count","copy_count","copy_users","def_desc","form_type","form_id","vars"
+            ]
+            st.dataframe([{k: v for k, v in r.items() if k in cols} for r in view], use_container_width=True)
+
+            # 详情抽屉
+            inst_ids = [r.get("proc_inst_id") for r in view]
+            if inst_ids:
+                sel = st.selectbox("选择实例ID查看详情", options=inst_ids, index=0, key="inst_sel")
+                if sel:
+                    st.markdown("---")
+                    st.subheader("实例详情")
+                    # 运行时任务
+                    st.markdown("**运行时任务**")
+                    ru_task = _read_sql_rows("act_ru_task")
+                    task_cols = ["id_","proc_inst_id_","name_","assignee_","owner_","create_time_","due_date_","category_","priority_"]
+                    task_detail = [r for r in ru_task if str(r.get("proc_inst_id_","")) == str(sel)]
+                    st.dataframe(_pick_cols(task_detail, task_cols), use_container_width=True)
+
+                    # 运行时执行树
+                    st.markdown("**运行时执行树**")
+                    ru_exec = _read_sql_rows("act_ru_execution")
+                    exec_cols = ["id_","proc_inst_id_","parent_id_","super_exec_","act_id_","is_active_","is_concurrent_","is_scope_"]
+                    exec_detail = [r for r in ru_exec if str(r.get("proc_inst_id_","")) == str(sel)]
+                    st.dataframe(_pick_cols(exec_detail, exec_cols), use_container_width=True)
+
+                    # 历史节点轨迹
+                    st.markdown("**历史节点轨迹（act_hi_actinst）**")
+                    hi_act = _read_sql_rows("act_hi_actinst")
+                    hact_cols = ["id_","proc_inst_id_","act_id_","act_name_","start_time_","end_time_","assignee_","task_id_"]
+                    hact_detail = [r for r in hi_act if str(r.get("proc_inst_id_","")) == str(sel)]
+                    st.dataframe(_pick_cols(hact_detail, hact_cols), use_container_width=True)
+
+                    # 变量全部键值
+                    st.markdown("**变量（全部）**")
+                    ru_var = _read_sql_rows("act_ru_variable")
+                    def _val(v):
+                        return v.get("text_") or v.get("double_") or v.get("long_") or ""
+                    var_detail = [r for r in ru_var if str(r.get("proc_inst_id_","")) == str(sel)]
+                    var_rows = [{"name_": v.get("name_",""), "value": _val(v), "execution_id_": v.get("execution_id_",""), "id_": v.get("id_","")} for v in var_detail]
+                    st.dataframe(var_rows, use_container_width=True)
+
+                    # 表单预览（绑定 bpm_process_definition_info → bpm_form）
+                    st.markdown("**表单预览**")
+                    hi = _read_sql_rows("act_hi_procinst")
+                    curr = next((r for r in hi if str(r.get("id_","")) == str(sel)), None)
+                    def _code_of(def_id):
+                        s = str(def_id or "")
+                        return s.split(":")[0] if ":" in s else s
+                    if curr:
+                        def_id = curr.get("proc_def_id_","")
+                        code = _code_of(def_id)
+                        def_info = _read_sql_rows("bpm_process_definition_info")
+                        di = next((d for d in def_info if _code_of(d.get("process_definition_id")) == code), None)
+                        if di:
+                            st.text(f"定义描述：{di.get('description','')}")
+                            st.text(f"表单类型：{di.get('form_type','')} 表单ID：{di.get('form_id','')}")
+                            form_type = str(di.get("form_type",""))
+                            if form_type == "10" and di.get("form_id"):
+                                forms = _read_sql_rows("bpm_form")
+                                fi = next((f for f in forms if str(f.get("id","")) == str(di.get("form_id"))), None)
+                                if fi:
+                                    st.text(f"表单名称：{fi.get('name','')} 状态：{fi.get('status','')}")
+                                    st.text(f"备注：{fi.get('remark','')}")
+                                    st.text(f"字段：{fi.get('fields','')}")
+                                else:
+                                    st.info("未找到对应的公共表单记录")
+                            else:
+                                st.text(f"定义内置字段：{di.get('form_fields','')}")
+                                st.text(f"定义内置配置：{di.get('form_conf','')}")
+                        else:
+                            st.info("未找到对应的流程定义扩展记录")
+            else:
+                st.info("暂无匹配的实例。")
+
+def render_file_mgmt():
+    st.title("📃 文件管理")
+    render_top_tabs('file')
+    st.info("文件管理：在此统一管理静态资源与文档。")
+
 
 # ================= 入口 =================
 def main():
@@ -1087,6 +1464,12 @@ def main():
         render_multi_mapping()
     elif st.session_state.page == "mapped":
         render_mapped_tables()
+    elif st.session_state.page == "flow":
+        render_flow_mgmt()
+    elif st.session_state.page == "file":
+        render_file_mgmt()
+    elif st.session_state.page == "home":
+        render_table_list()
     else:
         render_table_detail(st.session_state.current_table)
 
