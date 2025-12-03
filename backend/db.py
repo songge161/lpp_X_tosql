@@ -59,6 +59,16 @@ def init_db():
     except Exception as e:
         print("[init_db] 检查列失败:", e)
     conn.commit()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flow_entity_map (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            flow_define_name TEXT UNIQUE,
+            source_table TEXT,
+            target_entity TEXT
+        );
+        """
+    )
     conn.close()
 
 
@@ -124,6 +134,43 @@ def list_mapped_tables() -> List[Dict[str, Any]]:
         "disabled": int(r[3]),
         "description": r[4] or ""
     } for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+def get_flow_entity_map(flow_define_name: str) -> Dict[str, str]:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT source_table,target_entity FROM flow_entity_map WHERE flow_define_name=?",
+        (flow_define_name,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {}
+    return {"source_table": row[0] or "", "target_entity": row[1] or ""}
+
+def upsert_flow_entity_map(flow_define_name: str, source_table: str, target_entity: str) -> None:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO flow_entity_map (flow_define_name,source_table,target_entity)
+        VALUES (?,?,?)
+        ON CONFLICT(flow_define_name) DO UPDATE SET
+          source_table=excluded.source_table,
+          target_entity=excluded.target_entity
+        """,
+        (flow_define_name, source_table or "", target_entity or "")
+    )
+    conn.commit()
+    conn.close()
+
+def list_flow_entity_maps() -> List[Dict[str, str]]:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT flow_define_name,source_table,target_entity FROM flow_entity_map ORDER BY flow_define_name")
+    rows = [{"flow_define_name": r[0], "source_table": r[1] or "", "target_entity": r[2] or ""} for r in cur.fetchall()]
     conn.close()
     return rows
 
