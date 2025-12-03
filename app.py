@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 import streamlit as st
 import time
+from typing import Any, Dict
 
 # 顶部 import 部分
 from backend.db import (
@@ -259,7 +260,12 @@ def _build_instance_rows():
         def_by_code.setdefault(c, d)
     cat_name_by_code = {}
     for c in cats:
-        cat_name_by_code[str(c.get("code",""))] = c.get("name","")
+        try:
+            del_flag = int(str(c.get("deleted", 0) or 0))
+        except Exception:
+            del_flag = 0
+        if del_flag != 1:
+            cat_name_by_code[str(c.get("code",""))] = c.get("name","")
 
     from collections import defaultdict
     def _group(rows, key):
@@ -309,6 +315,7 @@ def _build_instance_rows():
             "proc_def_id": def_id,
             "def_code": code,
             "category": cat_name,
+            "flow_define_name": r.get("name_",""),
             "business_key": r.get("business_key_",""),
             "start_time": r.get("start_time_",""),
             "end_time": r.get("end_time_",""),
@@ -328,6 +335,298 @@ def _build_instance_rows():
     # 按开始时间倒序
     rows.sort(key=lambda x: str(x.get("start_time","")), reverse=True)
     return rows
+
+# 构建单个流程实例的 JSON 预览（基于 Flowable/Activiti act_* 与 bpm_* 本地 SQL）
+def _build_instance_json(proc_inst_id: str) -> Dict[str, Any]:
+    pid = str(proc_inst_id or "").strip()
+    if not pid:
+        return {}
+    hi = _read_sql_rows("act_hi_procinst")
+    hist = next((r for r in hi if str(r.get("id_","")) == pid), None)
+    if not hist:
+        return {"procInstId": pid, "error": "not found in act_hi_procinst"}
+
+    def _code_of(def_id):
+        s = str(def_id or "")
+        return s.split(":")[0] if ":" in s else s
+
+    def_id = hist.get("proc_def_id_", "")
+    def_code = _code_of(def_id)
+
+    # 运行时/历史明细
+    ru_task = [r for r in _read_sql_rows("act_ru_task") if str(r.get("proc_inst_id_","")) == pid]
+    ru_exec = [r for r in _read_sql_rows("act_ru_execution") if str(r.get("proc_inst_id_","")) == pid]
+    ru_var  = [r for r in _read_sql_rows("act_ru_variable") if str(r.get("proc_inst_id_","")) == pid]
+    hi_task = [r for r in _read_sql_rows("act_hi_taskinst") if str(r.get("proc_inst_id_","")) == pid]
+    hi_act  = [r for r in _read_sql_rows("act_hi_actinst")  if str(r.get("proc_inst_id_","")) == pid]
+    hi_var  = [r for r in _read_sql_rows("act_hi_varinst")  if str(r.get("proc_inst_id_","")) == pid]
+    hi_cmts = [r for r in _read_sql_rows("act_hi_comment")  if str(r.get("proc_inst_id_","")) == pid]
+    copies  = [r for r in _read_sql_rows("bpm_process_instance_copy") if str(r.get("process_instance_id","")) == pid]
+
+    # 定义与分类
+    def_info_all = _read_sql_rows("bpm_process_definition_info")
+    def_info = next((d for d in def_info_all if _code_of(d.get("process_definition_id")) == def_code), {})
+    cats = _read_sql_rows("bpm_category")
+    _cat_map = {}
+    _cat_map_any = {}
+    for c in cats:
+        code = str(c.get("code",""))
+        name = c.get("name","")
+        _cat_map_any[code] = name
+        try:
+            del_flag = int(str(c.get("deleted", 0) or 0))
+        except Exception:
+            del_flag = 0
+        if del_flag != 1:
+            _cat_map[code] = name
+    cat_name_by_code = _cat_map
+    category_name = cat_name_by_code.get(def_code, def_code)
+    flow_define_name = str(hist.get("name_", "") or "")
+
+    # 表单信息
+    form_preview = {}
+    form_type = str(def_info.get("form_type",""))
+    form_id = def_info.get("form_id")
+    if form_type == "10" and form_id:
+        forms = _read_sql_rows("bpm_form")
+        fi = next((f for f in forms if str(f.get("id","")) == str(form_id)), None)
+        if fi:
+            form_preview = {
+                "id": fi.get("id",""),
+                "name": fi.get("name",""),
+                "status": fi.get("status",""),
+                "remark": fi.get("remark",""),
+                "fields": fi.get("fields",""),
+                "conf": fi.get("conf",""),
+            }
+    else:
+        form_preview = {
+            "form_type": form_type,
+            "form_id": form_id or "",
+            "form_fields": def_info.get("form_fields",""),
+            "form_conf": def_info.get("form_conf",""),
+        }
+
+    # 变量归并为 name -> value
+    def _var_value(v):
+        return v.get("text_") or v.get("double_") or v.get("long_") or ""
+    runtime_vars = {str(v.get("name_","")): _var_value(v) for v in ru_var if v.get("name_")}
+    hist_vars    = {str(v.get("name_","")): _var_value(v) for v in hi_var if v.get("name_")}
+
+    # 运行时任务与执行树精选字段
+    run_tasks = _pick_cols(ru_task, ["id_","name_","assignee_","owner_","create_time_","due_date_","category_","priority_","proc_inst_id_"])
+    run_execs = _pick_cols(ru_exec, ["id_","parent_id_","super_exec_","act_id_","is_active_","is_concurrent_","is_scope_","proc_inst_id_"])
+    # 历史任务与节点轨迹精选字段
+    hist_tasks = _pick_cols(hi_task, ["id_","task_id_","name_","assignee_","start_time_","end_time_","proc_inst_id_"])
+    hist_acts  = _pick_cols(hi_act,  ["id_","act_id_","act_name_","assignee_","start_time_","end_time_","task_id_","proc_inst_id_"])
+
+    # 抄送记录精选字段
+    copy_rows = _pick_cols(copies, ["id","user_id","start_user_id","task_id","task_name","category","process_instance_id","process_instance_name","create_time","update_time"]) 
+
+    # 汇总 JSON
+    # 活动流水线（按开始时间排序）
+    pipeline = []
+    acts_sorted = sorted(hi_act, key=lambda a: str(a.get("start_time_", "") or ""))
+    for a in acts_sorted:
+        ex = str(a.get("execution_id_", ""))
+        tid = str(a.get("task_id_", ""))
+        activity = {
+            "id_": a.get("id_", ""),
+            "act_id_": a.get("act_id_", ""),
+            "act_name_": a.get("act_name_", ""),
+            "act_type_": a.get("act_type_", ""),
+            "assignee_": a.get("assignee_", ""),
+            "start_time_": a.get("start_time_", ""),
+            "end_time_": a.get("end_time_", ""),
+            "duration_": a.get("duration_", ""),
+            "task_id_": tid,
+        }
+        task_detail = next((t for t in hi_task if str(t.get("id_", "")) == tid), None)
+        if not task_detail:
+            task_detail = next((t for t in ru_task if str(t.get("id_", "")) == tid), None)
+        comments = [
+            {
+                "id_": c.get("id_", ""),
+                "time_": c.get("time_", ""),
+                "user_id_": c.get("user_id_", ""),
+                "action_": c.get("action_", ""),
+                "message_": c.get("message_", ""),
+            }
+            for c in hi_cmts if str(c.get("task_id_", "")) == tid
+        ]
+        var_run = [
+            {
+                "name_": v.get("name_", ""),
+                "value": _var_value(v),
+                "create_time_": v.get("create_time_", ""),
+                "last_updated_time_": v.get("last_updated_time_", ""),
+            }
+            for v in ru_var if str(v.get("execution_id_", "")) == ex
+        ]
+        var_hist = [
+            {
+                "name_": v.get("name_", ""),
+                "value": _var_value(v),
+                "create_time_": v.get("create_time_", ""),
+                "last_updated_time_": v.get("last_updated_time_", ""),
+            }
+            for v in hi_var if str(v.get("execution_id_", "")) == ex
+        ]
+        pipeline.append({
+            "activity": activity,
+            "task": task_detail or {},
+            "comments": comments,
+            "variables": {"runtime": var_run, "history": var_hist},
+        })
+
+    # segments：将 sequenceFlow / exclusiveGateway 归入前后节点之间的“经由”链路，使关系更直观
+    def _is_node(act_type: str) -> bool:
+        t = (act_type or "").lower()
+        return t in ("startevent", "usertask", "endevent")
+    def _is_via(act_type: str) -> bool:
+        t = (act_type or "").lower()
+        return t in ("sequenceflow", "exclusivegateway")
+    def _fmt_node(a: Dict[str, Any]) -> Dict[str, Any]:
+        if not a:
+            return {}
+        return {
+            "key": a.get("act_id_",""),
+            "name": a.get("act_name_",""),
+            "type": a.get("act_type_",""),
+            "assignee": a.get("assignee_",""),
+            "start": a.get("start_time_",""),
+            "end": a.get("end_time_",""),
+            "duration": a.get("duration_",""),
+        }
+    def _fmt_via(a: Dict[str, Any]) -> Dict[str, Any]:
+        if not a:
+            return {}
+        return {
+            "key": a.get("act_id_",""),
+            "type": a.get("act_type_",""),
+            "name": a.get("act_name_",""),
+            "time": a.get("start_time_",""),
+        }
+    def _trim_task(t: Dict[str, Any]) -> Dict[str, Any]:
+        if not t:
+            return {}
+        keys = [
+            "name_","assignee_","owner_","start_time_","end_time_",
+            "duration_","priority_","category_","delete_reason_",
+        ]
+        return {k: t.get(k, "") for k in keys}
+    def _values_imp(entry: Dict[str, Any]) -> Dict[str, Any]:
+        out = {}
+        vv = []
+        vhist = entry.get("variables", {}).get("history", [])
+        vrun  = entry.get("variables", {}).get("runtime", [])
+        vv.extend(vhist or [])
+        vv.extend(vrun or [])
+        def getv(name: str):
+            for v in vv:
+                if str(v.get("name_","")) == name:
+                    return v.get("value","")
+            return ""
+        out["TASK_STATUS"] = getv("TASK_STATUS")
+        out["TASK_REASON"] = getv("TASK_REASON")
+        out["loopCounter"] = getv("loopCounter")
+        assg = ""
+        for v in vv:
+            n = str(v.get("name_",""))
+            if n.endswith("_assignee"):
+                assg = v.get("value","")
+                break
+        out["assignee_var"] = assg
+        return out
+    def _last_comment(comments: Dict[str, Any]) -> Dict[str, Any]:
+        cs = list(comments or [])
+        if not cs:
+            return {}
+        cs.sort(key=lambda c: str(c.get("time_","")))
+        last = cs[-1]
+        return {"time": last.get("time_",""), "user_id": last.get("user_id_",""), "message": last.get("message_",""), "action": last.get("action_","")}
+    def _actors(entry: Dict[str, Any]) -> Dict[str, Any]:
+        s = set()
+        act = entry.get("activity", {})
+        t = entry.get("task", {})
+        s.add(str(act.get("assignee_","")))
+        s.add(str(t.get("assignee_","")))
+        s.add(str(t.get("owner_","")))
+        for c in entry.get("comments", []) or []:
+            s.add(str(c.get("user_id_","")))
+        s = {x for x in s if x and x != ""}
+        return {"ids": sorted(list(s))}
+    segments = []
+    i = 0
+    while i < len(pipeline):
+        seg_from_entry = pipeline[i]
+        a = seg_from_entry["activity"]
+        if not _is_node(a.get("act_type_","")):
+            i += 1
+            continue
+        via = []
+        j = i + 1
+        while j < len(pipeline):
+            aj = pipeline[j]["activity"]
+            if _is_via(aj.get("act_type_","")):
+                via.append(_fmt_via(aj))
+                j += 1
+                continue
+            # 遇到下一节点则结束当前分段
+            break
+        seg_to_entry = pipeline[j] if j < len(pipeline) else {"activity": {}}
+        to_node = seg_to_entry.get("activity", {})
+        for k in range(len(via)):
+            if (via[k].get("type", "")).lower() == "sequenceflow" and not via[k].get("name"):
+                guess = next((x.get("act_name_") for x in hi_act if str(x.get("act_id_", "")) == via[k].get("key", "") and x.get("act_name_")), "")
+                if not guess:
+                    guess = to_node.get("act_name_", "")
+                via[k]["name"] = guess or via[k].get("name", "")
+        segments.append({
+            "from": _fmt_node(a),
+            "via": via,
+            "to": _fmt_node(to_node) if to_node else {},
+            "to_task": _trim_task(seg_to_entry.get("task", {})) if to_node else {},
+            "to_values": _values_imp(seg_to_entry) if to_node else {},
+            "to_comment_last": _last_comment(seg_to_entry.get("comments", []) or []) if to_node else {},
+            "to_actor_ids": _actors(seg_to_entry).get("ids", []) if to_node else [],
+        })
+        i = j if j > i else i + 1
+
+    out = {
+        "procInstId": pid,
+        "procDefId": def_id,
+        "defCode": def_code,
+        "processName": category_name,
+        "flow_define_name": flow_define_name,
+        "businessKey": hist.get("business_key_",""),
+        "startTime": hist.get("start_time_",""),
+        "endTime": hist.get("end_time_",""),
+        "definition": {
+            "description": def_info.get("description",""),
+            "modelId": def_info.get("model_id",""),
+            "icon": def_info.get("icon",""),
+            "formType": form_type,
+            "formId": form_id or "",
+            "categoryName": category_name,
+            "flowDefineName": flow_define_name,
+            "formPreview": form_preview,
+        },
+        "runtime": {
+            "tasks": run_tasks,
+            "executions": run_execs,
+            "variables": runtime_vars,
+        },
+        "history": {
+            "tasks": hist_tasks,
+            "activities": hist_acts,
+            "variables": hist_vars,
+        },
+        "copies": copy_rows,
+        "pipeline": pipeline,
+        "segments": segments,
+    }
+    return out
 
 # function _ensure_all_fields_seeded(table_name: str, target_entity: str)
 def _ensure_all_fields_seeded(table_name: str, target_entity: str):
@@ -1202,17 +1501,188 @@ def render_flow_mgmt():
 
     with super_tabs[0]:
         st.subheader("表单转换管理")
-        st.info("管理表单配置与字段映射的转换规则与策略（占位）。")
+        kw = st.text_input("关键词（实例ID/业务键/定义编码）", key="form_conv_kw")
+        code_filter = st.text_input("按定义编码过滤（如 ContractApproval）", key="form_conv_code")
+        rows = _build_instance_rows()
+        flow_names = sorted({r.get("flow_define_name","") for r in rows if r.get("flow_define_name")})
+        flow_filter = st.selectbox("按流程名称过滤（flowDefineName）", options=["全部"] + flow_names, index=0, key="form_conv_flowname")
+        def _match(r):
+            s = (kw or "").strip().lower()
+            ok_kw = (not s) or s in str(r.get("proc_inst_id","")) .lower() or s in str(r.get("business_key","")) .lower() or s in str(r.get("def_code","")) .lower()
+            ok_code = (not code_filter) or str(r.get("def_code","")) == code_filter
+            ok_flow = (flow_filter in ("全部", "", None)) or str(r.get("flow_define_name","")) == flow_filter
+            return ok_kw and ok_code and ok_flow
+        view = [r for r in rows if _match(r)]
+        ids = [r.get("proc_inst_id") for r in view]
+        pid = st.selectbox("选择实例ID", options=ids or [""], index=0 if ids else None, key="form_conv_pid")
+        if pid:
+            data = _build_instance_json(pid)
+            rt_vars_list = data.get("runtime", {}).get("variables", [])
+            hi_vars_list = data.get("history", {}).get("variables", [])
+            def _var_map(vs):
+                if isinstance(vs, dict):
+                    return vs
+                m = {}
+                for v in vs or []:
+                    if isinstance(v, dict):
+                        n = str(v.get("name_",""))
+                        if n:
+                            m[n] = v.get("value","")
+                return m
+            rt_vars_map = _var_map(rt_vars_list)
+            hi_vars_map = _var_map(hi_vars_list)
+            biz_name = str(rt_vars_map.get("businessName") or hi_vars_map.get("businessName") or "")
+            if st.button("查看预览", key=f"preview_{pid}"):
+                st.session_state["flow_preview_pid"] = pid
+            if st.session_state.get("flow_preview_pid") == pid:
+                segs = data.get("segments", []) or []
+                nodes = []
+                for idx in range(len(segs)):
+                    seg = segs[idx]
+                    frm = seg.get("from", {})
+                    via = seg.get("via", []) or []
+                    to_ = seg.get("to", {})
+                    if idx == 0:
+                        nodes.append({
+                            "id": frm.get("key",""),
+                            "type": frm.get("type",""),
+                            "name": frm.get("name",""),
+                            "assignee": frm.get("assignee",""),
+                            "start": frm.get("start",""),
+                            "end": frm.get("end",""),
+                            "duration": frm.get("duration",""),
+                            "next": {"to": to_.get("key",""), "via": via},
+                        })
+                    next_obj = {}
+                    if idx + 1 < len(segs):
+                        nxt = segs[idx + 1]
+                        nxt_from = nxt.get("from", {})
+                        if nxt_from.get("key") == to_.get("key"):
+                            next_obj = {"to": nxt.get("to", {}).get("key",""), "via": nxt.get("via", []) or []}
+                    lc = seg.get("to_comment_last", {}) or {}
+                    nodes.append({
+                        "id": to_.get("key",""),
+                        "type": to_.get("type",""),
+                        "name": to_.get("name",""),
+                        "assignee": to_.get("assignee",""),
+                        "start": to_.get("start",""),
+                        "end": to_.get("end",""),
+                        "duration": to_.get("duration",""),
+                        "lastComment": {"time": lc.get("time",""), "userId": lc.get("user_id",""), "message": lc.get("message","")},
+                        "task": seg.get("to_task", {}) or {},
+                        "value": seg.get("to_values", {}) or {},
+                        "actor_ids": seg.get("to_actor_ids", []) or [],
+                        "next": next_obj,
+                    })
+                assignees = {}
+                for seg in segs:
+                    k = seg.get("to", {}).get("key","")
+                    a = seg.get("to_task", {}).get("assignee_","")
+                    if k:
+                        assignees[k] = a
+                history_vars = {
+                    "processStatus": str(hi_vars_map.get("processStatus","")),
+                    "taskStatus": str(hi_vars_map.get("taskStatus") or hi_vars_map.get("TASK_STATUS") or ""),
+                    "taskReason": str(hi_vars_map.get("taskReason") or hi_vars_map.get("TASK_REASON") or ""),
+                    "nrOfInstances": str(hi_vars_map.get("nrOfInstances","")),
+                    "nrOfActiveInstances": str(hi_vars_map.get("nrOfActiveInstances","")),
+                    "nrOfCompletedInstances": str(hi_vars_map.get("nrOfCompletedInstances","")),
+                    "isSign": str(hi_vars_map.get("isSign","")),
+                    "assignees": assignees,
+                }
+
+                def _flow_table_map():
+                    return {
+                        "合伙协议": "ct_partner_agreement",
+                        "募集协议审批流程": "ct_fund_base_info",
+                        "托管协议流程审批": "ct_fund_custody_agmt",
+                        "其他流程": "ct_agreement_other",
+                        "项目合规性审查": "ct_project_base_info",
+                        "基金出资记录": "ct_invest_record",
+                        "项目退出": "ct_fund_quit_record",
+                        "会议管理审批流程": "ct_meeting_manage",
+                        "业务审批": "ct_fund_meet_manage",
+                        "基金公示审核": "ct_fund_publicity_review",
+                        "股权直投业务审批": "ct_project_meet_manage",
+                        "股权直投，其他协议": "ct_project_agreement_other",
+                    }
+
+                fields_obj = {}
+                fdef = str(data.get("flow_define_name",""))
+                tbl = _flow_table_map().get(fdef)
+                if tbl:
+                    recs = _parse_all_inserts(tbl)
+                    match = next((r for r in recs if str(r.get("process_instance_id","")) == str(pid)), None)
+                    if match:
+                        from backend.db import get_target_entity, get_table_script
+                        from backend.mapper_core import _extract_entity_meta
+                        entity = get_target_entity(tbl) or ""
+                        script = get_table_script(tbl, entity or None) or ""
+                        mapped, _, _ = apply_record_mapping(tbl, match, script, target_entity=entity or "")
+                        _ = _extract_entity_meta(mapped)
+                        fields_obj = mapped or {}
+                preview_obj = {
+                    "meta": {
+                        "businessName": biz_name,
+                        "processName": data.get("defCode",""),
+                        "flowDefineName": data.get("flow_define_name",""),
+                        "startTime": data.get("startTime",""),
+                        "endTime": data.get("endTime",""),
+                        "icon": data.get("definition", {}).get("icon", ""),
+                    },
+                    "variables": {"runtime": {}, "history": history_vars, "fields": fields_obj},
+                    "nodes": nodes,
+                }
+                st.json(preview_obj)
+
+        st.markdown("---")
+        st.subheader("流程字段映射管理")
+        fmap = {
+            "合伙协议": "ct_partner_agreement",
+            "募集协议审批流程": "ct_fund_base_info",
+            "托管协议流程审批": "ct_fund_custody_agmt",
+            "其他流程": "ct_agreement_other",
+            "项目合规性审查": "ct_project_base_info",
+            "基金出资记录": "ct_invest_record",
+            "项目退出": "ct_fund_quit_record",
+            "会议管理审批流程": "ct_meeting_manage",
+            "业务审批": "ct_fund_meet_manage",
+            "基金公示审核": "ct_fund_publicity_review",
+            "股权直投业务审批": "ct_project_meet_manage",
+            "股权直投，其他协议": "ct_project_agreement_other",
+        }
+        rows = []
+        for k, v in fmap.items():
+            rows.append({"flowDefineName": k, "table": v, "link": f"?page=detail&table={v}"})
+        st.dataframe(rows, use_container_width=True)
+        st.caption("点击链接列进入对应表的字段映射管理页")
 
     with super_tabs[1]:
         st.subheader("表单转换入库")
         st.info("将转换后的表单数据批量入库，支持预览与校验（占位）。")
 
     with super_tabs[2]:
-        tabs = st.tabs(["流程定义", "表单库", "分类", "表达式库", "监听器库", "实例抄送", "用户组", "实例总览", "全部实例", "流程实例（综合）"]) 
+        tabs = st.tabs(["实例预览(JSON)", "流程定义", "表单库", "分类", "表达式库", "监听器库", "实例抄送", "用户组", "实例总览", "全部实例"]) 
+
+        # 实例预览（JSON）
+        with tabs[0]:
+            st.subheader("按流程实例聚合（JSON 预览）")
+            # 选择实例来源于历史实例表
+            hi = _read_sql_rows("act_hi_procinst")
+            all_pids = [r.get("id_","") for r in hi if r.get("id_")]
+            kw = st.text_input("关键词（实例ID/业务键）", key="json_kw")
+            def _match_pid(r):
+                s = (kw or "").strip().lower()
+                return (not s) or s in str(r.get("id_","")) .lower() or s in str(r.get("business_key_","")) .lower()
+            view_pids = [r.get("id_","") for r in hi if _match_pid(r)]
+            pid = st.selectbox("选择实例ID", options=view_pids or all_pids, index=0 if (view_pids or all_pids) else None, key="json_pid")
+            if pid:
+                data = _build_instance_json(pid)
+                st.json(data)
+                st.download_button("下载 JSON", data=json.dumps(data, ensure_ascii=False, indent=2), file_name=f"procinst_{pid}.json", mime="application/json")
 
         # 流程定义
-        with tabs[0]:
+        with tabs[1]:
             kw = st.text_input("关键词（定义ID/模型ID/描述）", key="pd_kw")
             recs = _parse_all_inserts("bpm_process_definition_info")
             def _code_of(pd_id: str):
@@ -1232,7 +1702,7 @@ def render_flow_mgmt():
             st.dataframe([{k: v for k, v in r.items() if k in cols} for r in view], use_container_width=True)
 
         # 表单库
-        with tabs[1]:
+        with tabs[2]:
             kw = st.text_input("关键词（表单名/备注）", key="form_kw")
             recs = _parse_all_inserts("bpm_form")
             def _match(r):
@@ -1244,13 +1714,13 @@ def render_flow_mgmt():
             st.dataframe([{k: v for k, v in r.items() if k in cols} for r in view], use_container_width=True)
 
         # 分类
-        with tabs[2]:
+        with tabs[3]:
             recs = _parse_all_inserts("bpm_category")
             cols = ["id","name","code","status","sort"]
             st.dataframe([{k: v for k, v in r.items() if k in cols} for r in recs], use_container_width=True)
 
         # 表达式库
-        with tabs[3]:
+        with tabs[4]:
             kw = st.text_input("关键词（表达式名/内容）", key="expr_kw")
             recs = _parse_all_inserts("bpm_process_expression")
             def _match(r):
@@ -1262,7 +1732,7 @@ def render_flow_mgmt():
             st.dataframe([{k: v for k, v in r.items() if k in cols} for r in view], use_container_width=True)
 
         # 监听器库
-        with tabs[4]:
+        with tabs[5]:
             kw = st.text_input("关键词（监听器名/事件/值）", key="lst_kw")
             recs = _parse_all_inserts("bpm_process_listener")
             def _match(r):
@@ -1275,7 +1745,7 @@ def render_flow_mgmt():
             st.dataframe([{k: v for k, v in r.items() if k in cols} for r in view], use_container_width=True)
 
         # 实例抄送
-        with tabs[5]:
+        with tabs[6]:
             kw = st.text_input("关键词（实例ID/任务ID/名称）", key="copy_kw")
             recs = _parse_all_inserts("bpm_process_instance_copy")
             def _match(r):
@@ -1288,13 +1758,13 @@ def render_flow_mgmt():
             st.dataframe([{k: v for k, v in r.items() if k in cols} for r in view], use_container_width=True)
 
         # 用户组
-        with tabs[6]:
+        with tabs[7]:
             recs = _parse_all_inserts("bpm_user_group")
             cols = ["id","name","description","user_ids","status"]
             st.dataframe([{k: v for k, v in r.items() if k in cols} for r in recs], use_container_width=True)
 
         # 实例总览（按 process_instance_id 聚合）
-        with tabs[7]:
+        with tabs[8]:
             recs = _read_sql_rows("bpm_process_instance_copy")
             if not recs:
                 st.info("暂无实例数据。")
@@ -1328,7 +1798,7 @@ def render_flow_mgmt():
                 st.dataframe(rows, use_container_width=True)
 
         # 全部实例（运行时 + 历史）
-        with tabs[8]:
+        with tabs[9]:
             st.subheader("历史实例")
             hi = _read_sql_rows("act_hi_procinst")
             hist_cols = ["id_","proc_def_id_","start_time_","end_time_","business_key_"]
@@ -1472,7 +1942,5 @@ def main():
         render_table_list()
     else:
         render_table_detail(st.session_state.current_table)
-
-
 if __name__ == "__main__":
     main()
