@@ -352,6 +352,58 @@ def update_many_field_mappings(table_name: str, data: List[Dict[str, str]], targ
             upsert_field_mapping(table_name, m["source_field"], m["target_paths"], m["rule"], target_entity=target_entity or "")
     conn.commit()
     conn.close()
+
+def rename_field_source(table_name: str, old_source_field: str, new_source_field: str, target_entity: str = "") -> bool:
+    if not table_name or not old_source_field or not new_source_field:
+        return False
+    if old_source_field == new_source_field:
+        return True
+    conn = _conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT target_paths, rule, enabled, order_idx FROM field_map
+            WHERE table_name=? AND source_field=? AND target_entity=?
+            """,
+            (table_name, old_source_field, target_entity or "")
+        )
+        row = cur.fetchone()
+        if not row:
+            return False
+        cur.execute(
+            "SELECT 1 FROM field_map WHERE table_name=? AND source_field=? AND target_entity=?",
+            (table_name, new_source_field, target_entity or "")
+        )
+        exists = cur.fetchone() is not None
+        now_ts = int(time.time())
+        if exists:
+            cur.execute(
+                """
+                UPDATE field_map SET target_paths=?, rule=?, enabled=?, order_idx=?, last_updated=?
+                WHERE table_name=? AND source_field=? AND target_entity=?
+                """,
+                (row[0], row[1], int(row[2]), int(row[3]), now_ts, table_name, new_source_field, target_entity or "")
+            )
+            cur.execute(
+                "DELETE FROM field_map WHERE table_name=? AND source_field=? AND target_entity=?",
+                (table_name, old_source_field, target_entity or "")
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE field_map SET source_field=?, last_updated=?
+                WHERE table_name=? AND source_field=? AND target_entity=?
+                """,
+                (new_source_field, now_ts, table_name, old_source_field, target_entity or "")
+            )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
 def delete_table_mapping(source_table: str, target_entity: str):
     """删除表及其映射目标"""
     conn = _conn()

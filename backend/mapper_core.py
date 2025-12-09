@@ -845,25 +845,27 @@ def _upsert_entity_row(type_name: str, key_field: str, key_value: Any,
 
             if row:  # 命中
                 uuid, old_name, old_data_json = row[0], row[1], row[2]
-                # 合并策略：当 import_mode 为 upsert 或 update_only 时也使用合并，避免覆盖丢字段
-                # 旧数据解析失败则回退为替换
+                # 合并/覆盖策略：
+                # - import_mode 包含 "replace" 时，直接覆盖（不合并）
+                # - 否则做深度合并，旧数据解析失败则回退为替换
                 merged_json = data_json
-                try:
-                    old_data = json.loads(old_data_json or "{}")
-                    new_data = json.loads(data_json or "{}")
-                    def deep_merge(a, b):
-                        for k, v in b.items():
-                            if isinstance(v, dict) and isinstance(a.get(k), dict):
-                                deep_merge(a[k], v)
-                            else:
-                                a[k] = v
-                        return a
-                    merged = deep_merge(old_data, new_data)
-                    merged_json = json.dumps(merged, ensure_ascii=False)
-                except Exception:
-                    merged_json = data_json
+                if "replace" not in str(import_mode or ""):
+                    try:
+                        old_data = json.loads(old_data_json or "{}")
+                        new_data = json.loads(data_json or "{}")
+                        def deep_merge(a, b):
+                            for k, v in b.items():
+                                if isinstance(v, dict) and isinstance(a.get(k), dict):
+                                    deep_merge(a[k], v)
+                                else:
+                                    a[k] = v
+                            return a
+                        merged = deep_merge(old_data, new_data)
+                        merged_json = json.dumps(merged, ensure_ascii=False)
+                    except Exception:
+                        merged_json = data_json
 
-                if import_mode in ("upsert", "update_only", "upsert_merge", "update_merge"):
+                if import_mode in ("upsert", "update_only", "upsert_merge", "update_merge", "upsert_replace", "update_replace"):
                     # 若 name 为空字符串，则保留旧 name
                     final_name = old_name if (name_val is None or str(name_val) == "") else name_val
                     upd_sql = """

@@ -207,6 +207,7 @@ def render_top_tabs(active: str):
         ("mapped", "🧩 映射结果管理"),
         ("multi_mapping", "🧩 多映射管理中心"),
         ("flow", "🧰 流程管理"),
+        ("user_dept", "👥 用户部门管理"),
         ("file", "📃 文件管理"),
     ]
     st.markdown(
@@ -604,6 +605,7 @@ def _build_instance_json(proc_inst_id: str) -> Dict[str, Any]:
         "businessKey": hist.get("business_key_",""),
         "startTime": hist.get("start_time_",""),
         "endTime": hist.get("end_time_",""),
+        "starterUserId": hist.get("start_user_id_",""),
         "definition": {
             "description": def_info.get("description",""),
             "modelId": def_info.get("model_id",""),
@@ -663,7 +665,7 @@ def _parse_nth_insert(table_name: str, index: int = 0):
     txt = p.read_text(encoding="utf-8", errors="ignore")
     inserts = list(re.finditer(
         r"insert\s+into\s+public\.\"?(?P<table>[\w\u4e00-\u9fa5]+)\"?"
-        r"\s*\((?P<cols>[^)]*)\)\s*values\s*\((?P<vals>[^)]*)\)",
+        r"\s*\((?P<cols>[^)]*)\)\s*values\s*\((?P<vals>[\s\S]*?)\)\s*;",
         txt, re.IGNORECASE
     ))
     if not inserts or index >= len(inserts):
@@ -717,7 +719,7 @@ def _parse_all_inserts(table_name: str):
     txt = p.read_text(encoding="utf-8", errors="ignore")
     inserts = list(re.finditer(
         r"insert\s+into\s+public\.\"?(?P<table>[\w\u4e00-\u9fa5]+)\"?"
-        r"\s*\((?P<cols>[^)]*)\)\s*values\s*\((?P<vals>[^)]*)\)",
+        r"\s*\((?P<cols>[^)]*)\)\s*values\s*\((?P<vals>[\s\S]*?)\)\s*;",
         txt, re.IGNORECASE
     ))
     out_records = []
@@ -761,6 +763,378 @@ def _parse_all_inserts(table_name: str):
             out_records.append(dict(zip(cols, vals)))
     return out_records
 
+
+_USER_MAP = None
+_USER_NAME_MAP = None
+_DEPT_MAP = None
+
+def _user_dept_maps():
+    global _USER_MAP, _USER_NAME_MAP, _DEPT_MAP
+    if _USER_MAP is None:
+        rows = _parse_all_inserts("sys_user")
+        m = {}
+        nmap = {}
+        for r in rows:
+            uid = str(r.get("user_id") or "").strip()
+            if not uid:
+                continue
+            name = str(r.get("nick_name") or "").strip()
+            dept_id = str(r.get("dept_id") or "").strip()
+            prev = m.get(uid)
+            if prev:
+                if not prev.get("dept_id") and dept_id:
+                    m[uid] = {"name": name, "dept_id": dept_id}
+            else:
+                m[uid] = {"name": name, "dept_id": dept_id}
+            if name:
+                prev = nmap.get(name)
+                if dept_id:
+                    nmap[name] = {"name": name, "dept_id": dept_id}
+                elif not prev:
+                    nmap[name] = {"name": name, "dept_id": dept_id}
+        _USER_MAP = m
+        _USER_NAME_MAP = nmap
+    if _DEPT_MAP is None:
+        rows = _parse_all_inserts("sys_dept")
+        _DEPT_MAP = {str(r.get("dept_id") or "").strip(): str(r.get("dept_name") or r.get("name") or "").strip() for r in rows}
+    return _USER_MAP, _DEPT_MAP
+
+def _enrich_nodes_with_user(nodes):
+    umap, dmap = _user_dept_maps()
+    out = []
+    for nd in nodes:
+        t = nd.get("task") or {}
+        assignee_id = str((t.get("assignee_") or nd.get("assignee") or "")).strip()
+        info = umap.get(assignee_id)
+        if not info and assignee_id:
+            info = (_USER_NAME_MAP or {}).get(assignee_id)
+        if info:
+            nd["assignee_val"] = info.get("name","")
+            dep = dmap.get(info.get("dept_id",""), "")
+            if not dep and info.get("name"):
+                aux = (_USER_NAME_MAP or {}).get(info.get("name",""))
+                dep = dmap.get((aux or {}).get("dept_id",""), "") or dep
+            nd["dept"] = dep
+        out.append(nd)
+    return out
+
+def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[str, Any]:
+    data = _build_instance_json(pid)
+    rt_vars_list = data.get("runtime", {}).get("variables", [])
+    hi_vars_list = data.get("history", {}).get("variables", [])
+    def _var_map(vs):
+        if isinstance(vs, dict):
+            return vs
+        m = {}
+        for v in vs or []:
+            if isinstance(v, dict):
+                n = str(v.get("name_",""))
+                if n:
+                    m[n] = v.get("value","")
+        return m
+    rt_vars_map = _var_map(rt_vars_list)
+    hi_vars_map = _var_map(hi_vars_list)
+    biz_name = str(rt_vars_map.get("businessName") or hi_vars_map.get("businessName") or "")
+    segs = data.get("segments", []) or []
+    nodes = []
+    for idx in range(len(segs)):
+        seg = segs[idx]
+        frm = seg.get("from", {})
+        via = seg.get("via", []) or []
+        to_ = seg.get("to", {})
+        if idx == 0:
+            nodes.append({
+                "id": frm.get("key",""),
+                "type": frm.get("type",""),
+                "name": frm.get("name",""),
+                "assignee": frm.get("assignee",""),
+                "start": frm.get("start",""),
+                "end": frm.get("end",""),
+                "duration": frm.get("duration",""),
+                "next": {"to": to_.get("key",""), "via": via},
+            })
+        next_obj = {}
+        if idx + 1 < len(segs):
+            nxt = segs[idx + 1]
+            nxt_from = nxt.get("from", {})
+            if nxt_from.get("key") == to_.get("key"):
+                next_obj = {"to": nxt.get("to", {}).get("key",""), "via": nxt.get("via", []) or []}
+        lc = seg.get("to_comment_last", {})
+        nodes.append({
+            "id": to_.get("key",""),
+            "type": to_.get("type",""),
+            "name": to_.get("name",""),
+            "assignee": to_.get("assignee",""),
+            "start": to_.get("start",""),
+            "end": to_.get("end",""),
+            "duration": to_.get("duration",""),
+            "lastComment": {"time": lc.get("time",""), "userId": lc.get("user_id",""), "message": lc.get("message","")},
+            "task": seg.get("to_task", {}) or {},
+            "value": seg.get("to_values", {}) or {},
+            "actor_ids": seg.get("to_actor_ids", []) or [],
+            "next": next_obj,
+        })
+    nodes = _enrich_nodes_with_user(nodes)
+    assignees = {}
+    for seg in segs:
+        k = seg.get("to", {}).get("key","")
+        a = seg.get("to_task", {}).get("assignee_","")
+        if k:
+            assignees[k] = a
+    history_vars = {
+        "processStatus": str(hi_vars_map.get("processStatus","")),
+        "taskStatus": str(hi_vars_map.get("taskStatus") or hi_vars_map.get("TASK_STATUS") or ""),
+        "taskReason": str(hi_vars_map.get("taskReason") or hi_vars_map.get("TASK_REASON") or ""),
+        "nrOfInstances": str(hi_vars_map.get("nrOfInstances","")),
+        "nrOfActiveInstances": str(hi_vars_map.get("nrOfActiveInstances","")),
+        "nrOfCompletedInstances": str(hi_vars_map.get("nrOfCompletedInstances","")),
+        "isSign": str(hi_vars_map.get("isSign","")),
+        "assignees": assignees,
+    }
+    starter_code = str(data.get("starterUserId") or ((nodes[0] or {}).get("assignee") or ((nodes[0] or {}).get("task") or {}).get("assignee_") or "")).strip() if nodes else str(data.get("starterUserId") or "")
+    preview_obj = {
+        "meta": {
+            "businessName": biz_name,
+            "processName": data.get("defCode",""),
+            "flowDefineName": data.get("flow_define_name",""),
+            "startTime": data.get("startTime",""),
+            "endTime": data.get("endTime",""),
+            "icon": data.get("definition", {}).get("icon", ""),
+            "starterCode": starter_code,
+        },
+        "variables": {"runtime": {}, "history": history_vars},
+        "nodes": nodes,
+    }
+    def _flow_table(flow_name: str):
+        fm = get_flow_entity_map(flow_name)
+        return fm.get("source_table") or {
+            "合伙协议": "ct_partner_agreement",
+            "募集协议审批流程": "ct_fund_base_info",
+            "托管协议流程审批": "ct_fund_custody_agmt",
+            "其他流程": "ct_agreement_other",
+            "项目合规性审查": "ct_project_base_info",
+            "基金出资记录": "ct_invest_record",
+            "项目退出": "ct_fund_quit_record",
+            "会议管理审批流程": "ct_meeting_manage",
+            "业务审批": "ct_fund_meet_manage",
+            "基金公示审核": "ct_fund_publicity_review",
+            "股权直投业务审批": "ct_project_meet_manage",
+            "股权直投，其他协议": "ct_project_agreement_other",
+        }.get(flow_name)
+    fields_obj = {}
+    fdef = str(data.get("flow_define_name",""))
+    tbl = _flow_table(fdef)
+    entity = ""
+    out_name = ""
+    type_override = ""
+    used_match = None
+    # 默认实体类型来自流程映射，即使没有样例匹配
+    fm0 = get_flow_entity_map(fdef)
+    if fm0.get("target_entity"):
+        entity = fm0.get("target_entity")
+    if tbl:
+        recs = _parse_all_inserts(tbl)
+        mm = match if match is not None else next((r for r in recs if str(r.get("process_instance_id","")) == str(pid)), None)
+        if mm:
+            script = get_table_script(tbl, entity or None) or ""
+            mapped, out_name, type_override = apply_record_mapping(tbl, mm, script, target_entity=entity or "")
+            _ = _extract_entity_meta(mapped)
+            fields_obj = mapped or {}
+            used_match = mm
+    src = json.dumps(preview_obj, ensure_ascii=False)
+    esc = src.replace("'", "''")
+    fields_obj = fields_obj or {}
+    fields_obj["source_flow"] = esc
+    try:
+        raw = fields_obj.get("source_flow", "")
+        parsed = json.loads(raw.replace("''", "'")) if raw else {}
+    except Exception:
+        parsed = preview_obj
+    meta_info = parsed.get("meta", {}) or {}
+    hist = (parsed.get("variables", {}) or {}).get("history", {}) or {}
+    nodes_md = []
+    def _fmt_duration_auto(v):
+        if v in (None, ""):
+            return ""
+        s = str(v).strip()
+        try:
+            x = float(s)
+        except Exception:
+            return s
+        secs = x / 1000.0 if x >= 1000 else x
+        secs = int(secs)
+        d = secs // 86400; secs %= 86400
+        h = secs // 3600; secs %= 3600
+        m = secs // 60; secs %= 60
+        parts = []
+        if d: parts.append(f"{d} 天")
+        if h: parts.append(f"{h} 小时")
+        if m: parts.append(f"{m} 分钟")
+        if secs and not parts:
+            parts.append(f"{secs} 秒")
+        return " ".join(parts) or "0 秒"
+    def _fmt_time(v):
+        if v in (None, ""):
+            return ""
+        s = str(v).strip()
+        try:
+            x = float(s)
+            ms = int(x) if x >= 1e11 else int(x * 1000)
+            from datetime import datetime
+            dt = datetime.fromtimestamp(ms / 1000.0)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            try:
+                from datetime import datetime
+                t = s.replace("T", " ").replace("Z", "")
+                dt = datetime.fromisoformat(t)
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return s
+    def _ts_num(v):
+        s = str(v or "").strip()
+        if not s:
+            return 0
+        try:
+            x = float(s)
+            ms = int(x) if x >= 1e11 else int(x * 1000)
+            return ms
+        except Exception:
+            try:
+                from datetime import datetime
+                t = s.replace("T", " ").replace("Z", "")
+                return int(datetime.fromisoformat(t).timestamp() * 1000)
+            except Exception:
+                return 0
+    nds_sorted = []
+    nodes_src = (parsed.get("nodes", []) or [])
+    for nd in nodes_src:
+        t = nd.get("task", {}) or {}
+        name0 = (t.get("name_") or nd.get("name", "") or "").strip()
+        if name0 in ("开始", "结束"):
+            continue
+        nds_sorted.append(nd)
+    if not nds_sorted and nodes_src:
+        nds_sorted = nodes_src
+    nds_sorted.sort(key=lambda n: _ts_num((n.get("task") or {}).get("end_time_") or n.get("end", "") or (n.get("task") or {}).get("start_time_") or n.get("start", "")), reverse=True)
+    for i, nd in enumerate(nds_sorted):
+        t = nd.get("task", {}) or {}
+        lc = nd.get("lastComment", {}) or {}
+        rawm = (str(lc.get('message') or '') + ' ' + str(t.get('delete_reason_') or '')).lower()
+        mk = '⚪'
+        for kw in ['同意','通过','批准','审核通过']:
+            if kw in rawm:
+                mk = '🟢'
+                break
+        if mk == '⚪':
+            for kw in ['驳回','退回','拒绝','不通过','不同意']:
+                if kw in rawm:
+                    mk = '🔴'
+                    break
+        task_name = (t.get('name_') or nd.get('name','') or '').strip()
+        assignee = (t.get('assignee_') or nd.get('assignee','') or '').strip()
+        start_txt = _fmt_time(t.get('start_time_') or nd.get('start',''))
+        end_txt = _fmt_time(t.get('end_time_') or nd.get('end',''))
+        dur_text = _fmt_duration_auto(t.get('duration_')) or _fmt_duration_auto(nd.get('duration'))
+        msg = (lc.get('message') or '').strip()
+        import re
+        def _split_msg(s: str):
+            s0 = (s or '').strip()
+            inline_extra = ''
+            suggest = ''
+            parts = re.split(r"[，,]?\s*(?:理由为|原因是)\s*[:：]", s0)
+            if len(parts) >= 2:
+                inline_extra = (parts[0] or '').strip().rstrip('，。')
+                suggest = (parts[1] or '').strip().rstrip('，。')
+                return inline_extra, suggest
+            suggest = s0
+            return inline_extra, suggest
+        inline_extra, suggest_text = _split_msg(msg)
+        if (not any([assignee, start_txt, end_txt, (dur_text or ''), msg])) and (task_name in ('结束','')):
+            continue
+        nodes_md.append(f"**审批任务：{task_name}**")
+        status_text = ("审批通过" if mk=='🟢' else ("审批未通过" if mk=='🔴' else ""))
+        if (not str(meta_info.get('endTime','')).strip()) and i == 0 and mk == '⚪':
+            status_text = "审批中"
+        status_line = f"{mk}{(inline_extra or status_text)}"
+        nodes_md.append(status_line)
+        nodes_md.append("")
+        av = str(nd.get("assignee_val") or "").strip()
+        dp = str(nd.get("dept") or "").strip()
+        disp = (f"{av}（{dp}）" if av and dp else (av or assignee))
+        if disp:
+            nodes_md.append(f"审批人：{disp}")
+            nodes_md.append("")
+        line = []
+        if start_txt:
+            line.append(f"创建时间：{start_txt}")
+        if end_txt:
+            line.append(f"审批时间： {end_txt}")
+        if dur_text:
+            line.append(f"耗时： {dur_text}")
+        if line:
+            nodes_md.append(" ".join(line))
+            nodes_md.append("")
+        nodes_md.append(f"审批建议：{suggest_text}" if suggest_text else "审批建议：")
+        nodes_md.append("")
+    hs_raw = str(hist.get('taskStatus','')).strip()
+    code_map = {
+        '0':'待审批','1':'审批中','2':'审批通过','3':'审批不通过','4':'已取消','5':'已回退','6':'委派中','7':'审批通过中','8':'自动抄送'
+    }
+    concl = code_map.get(hs_raw)
+    if not concl:
+        hs = hs_raw.lower()
+        hmk = ''
+        for kw in ['通过','同意','批准','审核通过']:
+            if kw in hs:
+                hmk = '审核通过'
+                break
+        if not hmk:
+            for kw in ['驳回','拒绝','不通过','不同意']:
+                if kw in hs:
+                    hmk = '审核未通过'
+                    break
+        concl = '审批通过' if hmk=='审核通过' else ('审批未通过' if hmk=='审核未通过' else hs_raw)
+    ended_raw = meta_info.get('endTime','')
+    ended_flag = bool(str(ended_raw).strip())
+    head_icon = '🟢' if concl in ('审批通过','审批通过中') else ('🔴' if concl in ('审批未通过','审批不通过') else '⚪')
+    header1 = f"**结束流程：在 {_fmt_time(ended_raw)} 结束**"
+    header2 = f"{head_icon} {concl}"
+    nds = parsed.get("nodes", []) or []
+    umap, _ = _user_dept_maps()
+    scode = str(meta_info.get("starterCode") or "").strip()
+    sname = (umap.get(scode) or {}).get("name", "")
+    starter = sname or (str(nds[0].get("assignee_val") or ((nds[0].get("task") or {}).get("assignee_") or nds[0].get("assignee") or "")).strip() if nds else "")
+    flow_name = str(meta_info.get("flowDefineName") or meta_info.get("processName") or "").strip()
+    start_md = f"**发起流程：【{starter}】在 {_fmt_time(meta_info.get('startTime',''))} 发起【 {flow_name} 】流程**"
+    flow_md = "\n".join(([header1, header2, ""] if ended_flag else []) + nodes_md + ["", start_md]).strip()
+    fields_obj["flow_md"] = flow_md
+    # 统一补全：确保 data 中包含 name/type/id
+    if (fields_obj.get("__name__") in (None, "")):
+        fields_obj["__name__"] = biz_name
+    type_name = (type_override or entity or tbl or fdef or "flow_instance")
+    fields_obj["name"] = biz_name
+    fields_obj["bt"] = biz_name
+    fields_obj["type"] = type_name
+    key_field = "id"
+    key_val = fields_obj.get("id") or (used_match or {}).get("id") or str(pid or "")
+    fields_obj["id"] = key_val
+    meta = _extract_entity_meta(fields_obj)
+    final_name = biz_name
+    return {
+        "fields_obj": fields_obj,
+        "flow_md": flow_md,
+        "meta": meta,
+        "type_name": type_name,
+        "key_field": key_field,
+        "key_val": key_val,
+        "final_name": final_name,
+        "tbl": tbl,
+        "entity": entity,
+        "out_name": out_name,
+        "type_override": type_override,
+        "match": used_match,
+    }
 
 def _guess_table_display_name(table_name: str) -> str:
     """从 DDL/注释猜测中文名称：匹配 -- 名称: xxx 或 /* name: xxx */，否则返回源表名"""
@@ -940,7 +1314,7 @@ def render_table_detail(table_name: str):
         new_tpath = cols[1].text_input(label="", value=m["target_paths"], key=t_key, placeholder="target_paths")
         new_rule  = cols[2].text_input(label="", value=m["rule"],         key=r_key, placeholder="rule")
 
-        changed = (new_tpath != m["target_paths"]) or (new_rule != m["rule"])
+        changed = (new_tpath != m["target_paths"]) or (new_rule != m["rule"]) 
         if changed:
             m["target_paths"] = new_tpath
             m["rule"] = new_rule
@@ -1655,22 +2029,34 @@ def render_flow_mgmt():
             "股权直投，其他协议": "ct_project_agreement_other",
         }
         for k, v in fmap.items():
-            c1, c2, c3, c4 = st.columns([2, 2, 3, 1])
+            fm = get_flow_entity_map(k)
+            curr_entity = fm.get("target_entity") or get_target_entity(v) or ""
+            curr_table = fm.get("source_table") or v
+            key_ent = f"flow_entity_custom_{k}"
+            key_src = f"flow_source_custom_{k}"
+            curr_link_entity = (str(st.session_state.get(key_ent) or "").strip() or str(curr_entity or "").strip())
+            curr_link_table = (str(st.session_state.get(key_src) or "").strip() or str(curr_table or "").strip())
+            c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 1])
             with c1:
                 st.text(k)
             with c2:
-                st.text(v)
+                link = f"?page=detail&table={curr_link_table}"
+                if curr_link_entity:
+                    link += f"&entity={curr_link_entity}"
+                st.markdown(f'🗂️ <a href="{link}" target="_blank"><code>{curr_link_table}</code></a>', unsafe_allow_html=True)
             with c3:
-                fm = get_flow_entity_map(k)
-                curr = fm.get("target_entity") or get_target_entity(v) or ""
-                custom = st.text_input("entity", value=curr, key=f"flow_entity_custom_{k}")
+                custom_src = st.text_input("source_table", value=curr_table, key=key_src)
             with c4:
+                custom_ent = st.text_input("entity", value=curr_entity, key=key_ent)
+            with c5:
                 if st.button("保存", key=f"flow_entity_save_{k}"):
-                    tgt = (custom or "").strip()
-                    if tgt:
-                        save_table_mapping(v, tgt, 0, "")
-                        upsert_flow_entity_map(k, v, tgt)
-                        st.success("已保存流程entity映射")
+                    src_val = (str(st.session_state.get(key_src) or custom_src or "").strip())
+                    ent_val = (str(st.session_state.get(key_ent) or custom_ent or "").strip())
+                    if src_val or ent_val:
+                        if ent_val:
+                            save_table_mapping(src_val, ent_val, 0, "")
+                        upsert_flow_entity_map(k, src_val, ent_val)
+                        st.success("已保存流程映射")
                         st.rerun()
 
     with super_tabs[1]:
@@ -1756,6 +2142,7 @@ def render_flow_mgmt():
                     "actor_ids": seg.get("to_actor_ids", []) or [],
                     "next": next_obj,
                 })
+            nodes = _enrich_nodes_with_user(nodes)
             assignees = {}
             for seg in segs:
                 k = seg.get("to", {}).get("key","")
@@ -1772,6 +2159,7 @@ def render_flow_mgmt():
                 "isSign": str(hi_vars_map.get("isSign","")),
                 "assignees": assignees,
             }
+            starter_code = str(data.get("starterUserId") or ((nodes[0] or {}).get("assignee") or ((nodes[0] or {}).get("task") or {}).get("assignee_") or "")).strip() if nodes else str(data.get("starterUserId") or "")
             preview_obj = {
                 "meta": {
                     "businessName": biz_name,
@@ -1780,6 +2168,7 @@ def render_flow_mgmt():
                     "startTime": data.get("startTime",""),
                     "endTime": data.get("endTime",""),
                     "icon": data.get("definition", {}).get("icon", ""),
+                    "starterCode": starter_code,
                 },
                 "variables": {"runtime": {}, "history": history_vars},
                 "nodes": nodes,
@@ -1883,14 +2272,17 @@ def render_flow_mgmt():
                     except Exception:
                         return 0
             nds_sorted = []
-            for nd in (parsed.get("nodes", []) or []):
+            nodes_src = (parsed.get("nodes", []) or [])
+            for nd in nodes_src:
                 t = nd.get("task", {}) or {}
                 name0 = (t.get("name_") or nd.get("name", "") or "").strip()
                 if name0 in ("开始", "结束"):
                     continue
                 nds_sorted.append(nd)
+            if not nds_sorted and nodes_src:
+                nds_sorted = nodes_src
             nds_sorted.sort(key=lambda n: _ts_num((n.get("task") or {}).get("end_time_") or n.get("end", "") or (n.get("task") or {}).get("start_time_") or n.get("start", "")), reverse=True)
-            for nd in nds_sorted:
+            for i, nd in enumerate(nds_sorted):
                 t = nd.get("task", {}) or {}
                 lc = nd.get("lastComment", {}) or {}
                 raw = (str(lc.get('message') or '') + ' ' + str(t.get('delete_reason_') or '')).lower()
@@ -1910,13 +2302,53 @@ def render_flow_mgmt():
                 end_txt = _fmt_time(t.get('end_time_') or nd.get('end',''))
                 dur_text = _fmt_duration_auto(t.get('duration_')) or _fmt_duration_auto(nd.get('duration'))
                 msg = (lc.get('message') or '').strip()
+                def _split_msg(s: str):
+                    s0 = (s or '').strip()
+                    inline_extra = ''
+                    suggest = ''
+                    import re
+                    m = re.match(r"^\s*审批(通过|未通过)[，,]?\s*原因是[:：]\s*(.+)$", s0)
+                    if m:
+                        suggest = (m.group(2) or '').strip()
+                        return inline_extra, suggest
+                    parts = re.split(r"[，,]?\s*理由为[:：]", s0)
+                    if len(parts) >= 2:
+                        inline_extra = (parts[0] or '').strip().rstrip('，。')
+                        suggest = (parts[1] or '').strip().rstrip('，。')
+                        return inline_extra, suggest
+                    suggest = s0
+                    return inline_extra, suggest
+                def _split_msg(s: str):
+                    s0 = (s or '').strip()
+                    inline_extra = ''
+                    suggest = ''
+                    import re
+                    m = re.match(r"^\s*审批(通过|未通过)[，,]?\s*原因是[:：]\s*(.+)$", s0)
+                    if m:
+                        suggest = (m.group(2) or '').strip()
+                        return inline_extra, suggest
+                    parts = re.split(r"[，,]?\s*理由为[:：]", s0)
+                    if len(parts) >= 2:
+                        inline_extra = (parts[0] or '').strip().rstrip('，。')
+                        suggest = (parts[1] or '').strip().rstrip('，。')
+                        return inline_extra, suggest
+                    suggest = s0
+                    return inline_extra, suggest
+                inline_extra, suggest_text = _split_msg(msg)
                 if (not any([assignee, start_txt, end_txt, (dur_text or ''), msg])) and (task_name in ('结束','')):
                     continue
                 nodes_md.append(f"**审批任务：{task_name}**")
-                nodes_md.append(f"{mk} " + ("审批通过" if mk=='🟢' else ("审批未通过" if mk=='🔴' else "")))
+                status_text = ("审批通过" if mk=='🟢' else ("审批未通过" if mk=='🔴' else ""))
+                if (not str(meta_info.get('endTime','')).strip()) and i == 0 and mk == '⚪':
+                    status_text = "审批中"
+                status_line = f"{mk}{(inline_extra or status_text)}"
+                nodes_md.append(status_line)
                 nodes_md.append("")
-                if assignee:
-                    nodes_md.append(f"审批人：{assignee}")
+                av = str(nd.get("assignee_val") or "").strip()
+                dp = str(nd.get("dept") or "").strip()
+                disp = (f"{av}（{dp}）" if av and dp else (av or assignee))
+                if disp:
+                    nodes_md.append(f"审批人：{disp}")
                     nodes_md.append("")
                 line = []
                 if start_txt:
@@ -1928,30 +2360,59 @@ def render_flow_mgmt():
                 if line:
                     nodes_md.append(" ".join(line))
                     nodes_md.append("")
-                nodes_md.append(f"审批建议：{msg}" if msg else "审批建议：")
+                nodes_md.append(f"审批建议：{suggest_text}" if suggest_text else "审批建议：")
                 nodes_md.append("")
-            hs = str(hist.get('taskStatus','')).strip().lower()
-            hmk = ''
-            for kw in ['通过','同意','批准','审核通过']:
-                if kw in hs:
-                    hmk = '审核通过'
-                    break
-            if not hmk:
-                for kw in ['驳回','拒绝','不通过','不同意']:
+            if not nodes_md:
+                for tsk in (data.get("runtime", {}) or {}).get("tasks", []) or []:
+                    name_rt = (tsk.get("name_", "") or "").strip()
+                    assignee_rt = (tsk.get("assignee_", "") or "").strip()
+                    start_txt_rt = _fmt_time(tsk.get("create_time_"))
+                    nodes_md.append(f"**审批任务：{name_rt}**")
+                    nodes_md.append("⚪审批中")
+                    nodes_md.append("")
+                    disp_rt = assignee_rt
+                    if disp_rt:
+                        nodes_md.append(f"审批人：{disp_rt}")
+                        nodes_md.append("")
+                    line_rt = []
+                    if start_txt_rt:
+                        line_rt.append(f"创建时间：{start_txt_rt}")
+                    if line_rt:
+                        nodes_md.append(" ".join(line_rt))
+                        nodes_md.append("")
+                    nodes_md.append("审批建议：")
+                    nodes_md.append("")
+            hs_raw = str(hist.get('taskStatus','')).strip()
+            code_map = {
+                '0':'待审批','1':'审批中','2':'审批通过','3':'审批不通过','4':'已取消','5':'已回退','6':'委派中','7':'审批通过中','8':'自动抄送'
+            }
+            concl = code_map.get(hs_raw)
+            if not concl:
+                hs = hs_raw.lower()
+                hmk = ''
+                for kw in ['通过','同意','批准','审核通过']:
                     if kw in hs:
-                        hmk = '审核未通过'
+                        hmk = '审核通过'
                         break
-            concl = '审批通过' if hmk=='审核通过' else ('审批未通过' if hmk=='审核未通过' else str(hist.get('taskStatus','')).strip())
-            head_icon = '🟢' if concl=='审批通过' else ('🔴' if concl=='审批未通过' else '⚪')
-            header1 = f"**结束流程：在 {_fmt_time(meta_info.get('endTime',''))} 结束**"
+                if not hmk:
+                    for kw in ['驳回','拒绝','不通过','不同意']:
+                        if kw in hs:
+                            hmk = '审核未通过'
+                            break
+                concl = '审批通过' if hmk=='审核通过' else ('审批未通过' if hmk=='审核未通过' else hs_raw)
+            ended_raw = meta_info.get('endTime','')
+            ended_flag = bool(str(ended_raw).strip())
+            head_icon = '🟢' if concl in ('审批通过','审批通过中') else ('🔴' if concl in ('审批未通过','审批不通过') else '⚪')
+            header1 = f"**结束流程：在 {_fmt_time(ended_raw)} 结束**"
             header2 = f"{head_icon} {concl}"
             nds = parsed.get("nodes", []) or []
-            starter = ""
-            if nds:
-                starter = str(((nds[0].get("task") or {}).get("assignee_") or nds[0].get("assignee") or "")).strip()
+            umap, _ = _user_dept_maps()
+            scode = str(meta_info.get("starterCode") or "").strip()
+            sname = (umap.get(scode) or {}).get("name", "")
+            starter = sname or (str(nds[0].get("assignee_val") or ((nds[0].get("task") or {}).get("assignee_") or nds[0].get("assignee") or "")).strip() if nds else "")
             flow_name = str(meta_info.get("flowDefineName") or meta_info.get("processName") or "").strip()
             start_md = f"**发起流程：【{starter}】在 {_fmt_time(meta_info.get('startTime',''))} 发起【 {flow_name} 】流程**"
-            flow_md = "\n".join([header1, header2, "", *nodes_md, "", start_md]).strip()
+            flow_md = "\n".join(([header1, header2, ""] if ended_flag else []) + nodes_md + ["", start_md]).strip()
             fields_obj["flow_md"] = flow_md
             meta = _extract_entity_meta(fields_obj)
             entity_obj = {
@@ -1969,270 +2430,100 @@ def render_flow_mgmt():
             if md:
                 st.markdown(md)
 
-        if final_pid and st.button("入库当前", key=f"import_{final_pid}"):
-            data = _build_instance_json(final_pid)
-            rt_vars_list = data.get("runtime", {}).get("variables", [])
-            hi_vars_list = data.get("history", {}).get("variables", [])
-            def _var_map(vs):
-                if isinstance(vs, dict):
-                    return vs
-                m = {}
-                for v in vs or []:
-                    if isinstance(v, dict):
-                        n = str(v.get("name_",""))
-                        if n:
-                            m[n] = v.get("value","")
-                return m
-            rt_vars_map = _var_map(rt_vars_list)
-            hi_vars_map = _var_map(hi_vars_list)
-            biz_name = str(rt_vars_map.get("businessName") or hi_vars_map.get("businessName") or "")
-            segs = data.get("segments", []) or []
-            nodes = []
-            for idx in range(len(segs)):
-                seg = segs[idx]
-                frm = seg.get("from", {})
-                via = seg.get("via", []) or []
-                to_ = seg.get("to", {})
-                if idx == 0:
-                    nodes.append({
-                        "id": frm.get("key",""),
-                        "type": frm.get("type",""),
-                        "name": frm.get("name",""),
-                        "assignee": frm.get("assignee",""),
-                        "start": frm.get("start",""),
-                        "end": frm.get("end",""),
-                        "duration": frm.get("duration",""),
-                        "next": {"to": to_.get("key",""), "via": via},
-                    })
-                next_obj = {}
-                if idx + 1 < len(segs):
-                    nxt = segs[idx + 1]
-                    nxt_from = nxt.get("from", {})
-                    if nxt_from.get("key") == to_.get("key"):
-                        next_obj = {"to": nxt.get("to", {}).get("key",""), "via": nxt.get("via", []) or []}
-                lc = seg.get("to_comment_last", {}) or {}
-                nodes.append({
-                    "id": to_.get("key",""),
-                    "type": to_.get("type",""),
-                    "name": to_.get("name",""),
-                    "assignee": to_.get("assignee",""),
-                    "start": to_.get("start",""),
-                    "end": to_.get("end",""),
-                    "duration": to_.get("duration",""),
-                    "lastComment": {"time": lc.get("time",""), "userId": lc.get("user_id",""), "message": lc.get("message","")},
-                    "task": seg.get("to_task", {}) or {},
-                    "value": seg.get("to_values", {}) or {},
-                    "actor_ids": seg.get("to_actor_ids", []) or [],
-                    "next": next_obj,
-                })
-            history_vars = {
-                "processStatus": str(hi_vars_map.get("processStatus","")),
-                "taskStatus": str(hi_vars_map.get("taskStatus") or hi_vars_map.get("TASK_STATUS") or ""),
-                "taskReason": str(hi_vars_map.get("taskReason") or hi_vars_map.get("TASK_REASON") or ""),
-                "nrOfInstances": str(hi_vars_map.get("nrOfInstances","")),
-                "nrOfActiveInstances": str(hi_vars_map.get("nrOfActiveInstances","")),
-                "nrOfCompletedInstances": str(hi_vars_map.get("nrOfCompletedInstances","")),
-                "isSign": str(hi_vars_map.get("isSign","")),
-                "assignees": {},
-            }
-            preview_obj = {
-                "meta": {
-                    "businessName": biz_name,
-                    "processName": data.get("defCode",""),
-                    "flowDefineName": data.get("flow_define_name",""),
-                    "startTime": data.get("startTime",""),
-                    "endTime": data.get("endTime",""),
-                    "icon": data.get("definition", {}).get("icon", ""),
-                },
-                "variables": {"runtime": {}, "history": history_vars},
-                "nodes": nodes,
-            }
-            def _flow_table(flow_name: str):
-                fm = get_flow_entity_map(flow_name)
-                return fm.get("source_table") or {
-                    "合伙协议": "ct_partner_agreement",
-                    "募集协议审批流程": "ct_fund_base_info",
-                    "托管协议流程审批": "ct_fund_custody_agmt",
-                    "其他流程": "ct_agreement_other",
-                    "项目合规性审查": "ct_project_base_info",
-                    "基金出资记录": "ct_invest_record",
-                    "项目退出": "ct_fund_quit_record",
-                    "会议管理审批流程": "ct_meeting_manage",
-                    "业务审批": "ct_fund_meet_manage",
-                    "基金公示审核": "ct_fund_publicity_review",
-                    "股权直投业务审批": "ct_project_meet_manage",
-                    "股权直投，其他协议": "ct_project_agreement_other",
-                }.get(flow_name)
-            fields_obj = {}
-            fdef = str(data.get("flow_define_name",""))
-            tbl = _flow_table(fdef)
-            entity = ""
-            out_name = ""
-            type_override = ""
-            if tbl:
-                recs = _parse_all_inserts(tbl)
-                match = next((r for r in recs if str(r.get("process_instance_id","")) == str(final_pid)), None)
-                if match:
-                    fm = get_flow_entity_map(fdef)
-                    entity = (fm.get("target_entity") or get_target_entity(tbl) or "")
-                    script = get_table_script(tbl, entity or None) or ""
-                    mapped, out_name, type_override = apply_record_mapping(tbl, match, script, target_entity=entity or "")
-                    _ = _extract_entity_meta(mapped)
-                    fields_obj = mapped or {}
-            src = json.dumps(preview_obj, ensure_ascii=False)
-            esc = src.replace("'", "''")
-            fields_obj = fields_obj or {}
-            fields_obj["source_flow"] = esc
-            try:
-                raw = fields_obj.get("source_flow", "")
-                parsed = json.loads(raw.replace("''", "'")) if raw else {}
-            except Exception:
-                parsed = preview_obj
-            meta_info = parsed.get("meta", {}) or {}
-            hist = (parsed.get("variables", {}) or {}).get("history", {}) or {}
-            nodes_md = []
-            def _fmt_duration_auto(v):
-                if v in (None, ""):
-                    return ""
-                s = str(v).strip()
-                try:
-                    x = float(s)
-                except Exception:
-                    return s
-                secs = x / 1000.0 if x >= 1000 else x
-                secs = int(secs)
-                d = secs // 86400; secs %= 86400
-                h = secs // 3600; secs %= 3600
-                m = secs // 60; secs %= 60
-                parts = []
-                if d: parts.append(f"{d} 天")
-                if h: parts.append(f"{h} 小时")
-                if m: parts.append(f"{m} 分钟")
-                if secs and not parts:
-                    parts.append(f"{secs} 秒")
-                return " ".join(parts) or "0 秒"
-            def _fmt_time(v):
-                if v in (None, ""):
-                    return ""
-                s = str(v).strip()
-                try:
-                    x = float(s)
-                    ms = int(x) if x >= 1e11 else int(x * 1000)
-                    from datetime import datetime
-                    dt = datetime.fromtimestamp(ms / 1000.0)
-                    return dt.strftime("%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    try:
-                        from datetime import datetime
-                        t = s.replace("T", " ").replace("Z", "")
-                        dt = datetime.fromisoformat(t)
-                        return dt.strftime("%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        return s
-            def _ts_num(v):
-                s = str(v or "").strip()
-                if not s:
-                    return 0
-                try:
-                    x = float(s)
-                    ms = int(x) if x >= 1e11 else int(x * 1000)
-                    return ms
-                except Exception:
-                    try:
-                        from datetime import datetime
-                        t = s.replace("T", " ").replace("Z", "")
-                        return int(datetime.fromisoformat(t).timestamp() * 1000)
-                    except Exception:
-                        return 0
-            nds_sorted = []
-            for nd in (parsed.get("nodes", []) or []):
-                t = nd.get("task", {}) or {}
-                name0 = (t.get("name_") or nd.get("name", "") or "").strip()
-                if name0 in ("开始", "结束"):
-                    continue
-                nds_sorted.append(nd)
-            nds_sorted.sort(key=lambda n: _ts_num((n.get("task") or {}).get("end_time_") or n.get("end", "") or (n.get("task") or {}).get("start_time_") or n.get("start", "")), reverse=True)
-            for nd in nds_sorted:
-                t = nd.get("task", {}) or {}
-                lc = nd.get("lastComment", {}) or {}
-                raw = (str(lc.get('message') or '') + ' ' + str(t.get('delete_reason_') or '')).lower()
-                mk = '⚪'
-                for kw in ['同意','通过','批准','审核通过']:
-                    if kw in raw:
-                        mk = '🟢'
-                        break
-                if mk == '⚪':
-                    for kw in ['驳回','退回','拒绝','不通过','不同意']:
-                        if kw in raw:
-                            mk = '🔴'
-                            break
-                task_name = (t.get('name_') or nd.get('name','') or '').strip()
-                assignee = (t.get('assignee_') or nd.get('assignee','') or '').strip()
-                start_txt = _fmt_time(t.get('start_time_') or nd.get('start',''))
-                end_txt = _fmt_time(t.get('end_time_') or nd.get('end',''))
-                dur_text = _fmt_duration_auto(t.get('duration_')) or _fmt_duration_auto(nd.get('duration'))
-                msg = (lc.get('message') or '').strip()
-                if (not any([assignee, start_txt, end_txt, (dur_text or ''), msg])) and (task_name in ('结束','')):
-                    continue
-                nodes_md.append(f"**审批任务：{task_name}**")
-                nodes_md.append(f"{mk} " + ("审批通过" if mk=='🟢' else ("审批未通过" if mk=='🔴' else "")))
-                nodes_md.append("")
-                if assignee:
-                    nodes_md.append(f"审批人：{assignee}")
-                    nodes_md.append("")
-                line = []
-                if start_txt:
-                    line.append(f"创建时间：{start_txt}")
-                if end_txt:
-                    line.append(f"审批时间： {end_txt}")
-                if dur_text:
-                    line.append(f"耗时： {dur_text}")
-                if line:
-                    nodes_md.append(" ".join(line))
-                    nodes_md.append("")
-                nodes_md.append(f"审批建议：{msg}" if msg else "审批建议：")
-                nodes_md.append("")
-            hs = str(hist.get('taskStatus','')).strip().lower()
-            hmk = ''
-            for kw in ['通过','同意','批准','审核通过']:
-                if kw in hs:
-                    hmk = '审核通过'
-                    break
-            if not hmk:
-                for kw in ['驳回','拒绝','不通过','不同意']:
-                    if kw in hs:
-                        hmk = '审核未通过'
-                        break
-            concl = '审批通过' if hmk=='审核通过' else ('审批未通过' if hmk=='审核未通过' else str(hist.get('taskStatus','')).strip())
-            header1 = f"**结束流程：在 {_fmt_time(meta_info.get('endTime',''))} 结束**"
-            head_icon = '🟢' if concl=='审批通过' else ('🔴' if concl=='审批未通过' else '⚪')
-            header2 = f"{head_icon} {concl}"
-            nds = parsed.get("nodes", []) or []
-            starter = ""
-            if nds:
-                starter = str(((nds[0].get("task") or {}).get("assignee_") or nds[0].get("assignee") or "")).strip()
-            flow_name = str(meta_info.get("flowDefineName") or meta_info.get("processName") or "").strip()
-            start_md = f"**发起流程：【{starter}】在 {_fmt_time(meta_info.get('startTime',''))} 发起【 {flow_name} 】流程**"
-            flow_md = "\n".join([header1, header2, "", *nodes_md, "", start_md]).strip()
-            fields_obj["flow_md"] = flow_md
-            meta = _extract_entity_meta(fields_obj)
-            fm2 = get_flow_entity_map(fdef)
-            fallback_type = (fm2.get("target_entity") or get_target_entity(tbl) or tbl or "")
-            if fields_obj.get("id") or ((match or {}).get("id")):
-                type_name = (type_override or entity or fallback_type)
-                key_field = "id"
-                key_val = fields_obj.get("id") or (match or {}).get("id") or ""
+        write_mode = st.selectbox(
+            "写入模式",
+            options=["合并写入（默认）", "仅保存 source_flow/flow_md 覆盖"],
+            index=0,
+            key=f"flow_write_mode_{flow_sel}"
+        )
+        if typed_pid and st.button("入库当前", key=f"import_{final_pid}"):
+            bundle = _build_flow_import_bundle(final_pid)
+            fields_obj = bundle.get("fields_obj") or {}
+            flow_md = bundle.get("flow_md") or ""
+            meta = bundle.get("meta") or {}
+            type_name = bundle.get("type_name") or ""
+            key_field = bundle.get("key_field") or "id"
+            key_val = bundle.get("key_val") or ""
+            final_name = bundle.get("final_name") or ""
+            used_match = bundle.get("match")
+            if write_mode == "仅保存 source_flow/flow_md 覆盖":
+                key_val = (used_match or {}).get("id") or key_val or str(final_pid or "")
+                if fields_obj.get("id") in (None, "") and key_val:
+                    fields_obj["id"] = key_val
+                cover_obj = {
+                    key_field: key_val,
+                    "name": fields_obj.get("name", ""),
+                    "bt": fields_obj.get("bt", ""),
+                    "type": fields_obj.get("type", type_name),
+                    "source_flow": fields_obj.get("source_flow",""),
+                    "flow_md": flow_md
+                }
+                data_json = json.dumps(cover_obj, ensure_ascii=False)
+                import_mode = "upsert_replace"
+                sid = st.session_state.get("current_sid", SID)
+                wrote = _upsert_entity_row(type_name, key_field, key_val, sid, final_name, data_json, meta, import_mode=import_mode)
+                st.success(f"入库完成：写入 {wrote} 条")
             else:
-                type_name = fallback_type
-                key_field = "process_instance_id"
-                key_val = str(final_pid)
-                fields_obj["process_instance_id"] = key_val
-                if not fields_obj.get("__name__"):
-                    fields_obj["__name__"] = biz_name
-            data_json = json.dumps(fields_obj, ensure_ascii=False)
-            sid = st.session_state.get("current_sid", SID)
-            wrote = _upsert_entity_row(type_name, key_field, key_val, sid, (fields_obj.get("__name__") or out_name or ""), data_json, meta, import_mode="upsert")
-            st.success(f"入库完成：写入 {wrote} 条")
+                if not key_val:
+                    key_val = str(final_pid or "")
+                    if key_val:
+                        fields_obj["id"] = key_val
+                data_json = json.dumps(fields_obj, ensure_ascii=False)
+                import_mode = "upsert"
+                sid = st.session_state.get("current_sid", SID)
+                wrote = _upsert_entity_row(type_name, key_field, key_val, sid, final_name, data_json, meta, import_mode=import_mode)
+                st.success(f"入库完成：写入 {wrote} 条")
+            st.stop()
+
+        elif st.button("批量入库当前流程全部", key=f"import_all_{flow_sel}"):
+            rows = _build_instance_rows()
+            def _match_flow(r):
+                return str(r.get("flow_define_name","")) == str(flow_sel)
+            view = [r for r in rows if _match_flow(r)]
+            pids_all = [r.get("proc_inst_id") for r in view]
+            pg = st.progress(0)
+            total = len(pids_all)
+            wrote_sum = 0
+            for i, pid0 in enumerate(pids_all or []):
+                pg.progress(int(((i) / (total or 1)) * 100))
+                if not pid0:
+                    continue
+                bundle = _build_flow_import_bundle(pid0)
+                fields_obj = bundle.get("fields_obj") or {}
+                flow_md = bundle.get("flow_md") or ""
+                meta = bundle.get("meta") or {}
+                type_name = bundle.get("type_name") or ""
+                key_field = bundle.get("key_field") or "id"
+                key_val = bundle.get("key_val") or ""
+                final_name = bundle.get("final_name") or ""
+                used_match = bundle.get("match")
+                if write_mode == "仅保存 source_flow/flow_md 覆盖":
+                    if not key_val:
+                        key_val = str(pid0 or "")
+                        if key_val:
+                            fields_obj["id"] = key_val
+                    cover_obj = {
+                        key_field: key_val,
+                        "name": fields_obj.get("name", ""),
+                        "bt": fields_obj.get("bt", ""),
+                        "type": fields_obj.get("type", type_name),
+                        "source_flow": fields_obj.get("source_flow",""),
+                        "flow_md": flow_md
+                    }
+                    data_json = json.dumps(cover_obj, ensure_ascii=False)
+                    import_mode = "upsert_replace"
+                else:
+                    if not key_val:
+                        key_val = str(pid0 or "")
+                        if key_val:
+                            fields_obj["id"] = key_val
+                    data_json = json.dumps(fields_obj, ensure_ascii=False)
+                    import_mode = "upsert"
+                sid = st.session_state.get("current_sid", SID)
+                wrote = _upsert_entity_row(type_name, key_field, key_val, sid, final_name, data_json, meta, import_mode=import_mode)
+                wrote_sum += int(wrote or 0)
+            pg.progress(100)
+            st.success(f"批量入库完成：写入 {wrote_sum} 条")
 
     with super_tabs[2]:
         tabs = st.tabs(["实例预览(JSON)", "流程定义", "表单库", "分类", "表达式库", "监听器库", "实例抄送", "用户组", "实例总览", "全部实例"]) 
@@ -2486,6 +2777,39 @@ def render_file_mgmt():
     st.info("文件管理：在此统一管理静态资源与文档。")
 
 
+def render_user_dept_mgmt():
+    st.title("👥 用户部门管理")
+    render_top_tabs('user_dept')
+    kw = st.text_input("关键词（姓名/ID/部门）", key="user_dept_kw")
+    only_missing = st.checkbox("仅看缺失部门", value=False, key="user_dept_missing")
+    rows = _parse_all_inserts("sys_user")
+    umap, dmap = _user_dept_maps()
+    data = []
+    for r in rows:
+        uid = str(r.get("user_id") or "").strip()
+        name = str(r.get("nick_name") or "").strip()
+        did = str(r.get("dept_id") or "").strip()
+        dname = dmap.get(did, "")
+        item = {"user_id": uid, "nick_name": name, "dept_id": did, "dept_name": dname}
+        if kw:
+            s = kw.strip().lower()
+            if not (s in uid.lower() or s in name.lower() or s in did.lower() or s in dname.lower()):
+                continue
+        if only_missing and dname:
+            continue
+        data.append(item)
+    st.dataframe(data, use_container_width=True)
+    cols = st.columns([1,1,6])
+    with cols[0]:
+        if st.button("🔄 刷新映射", key="user_dept_refresh"):
+            global _USER_MAP, _USER_NAME_MAP, _DEPT_MAP
+            _USER_MAP = None
+            _USER_NAME_MAP = None
+            _DEPT_MAP = None
+            _user_dept_maps()
+            st.rerun()
+
+
 # ================= 入口 =================
 def main():
     if "page" not in st.session_state:
@@ -2509,6 +2833,8 @@ def main():
         render_mapped_tables()
     elif st.session_state.page == "flow":
         render_flow_mgmt()
+    elif st.session_state.page == "user_dept":
+        render_user_dept_mgmt()
     elif st.session_state.page == "file":
         render_file_mgmt()
     elif st.session_state.page == "home":
