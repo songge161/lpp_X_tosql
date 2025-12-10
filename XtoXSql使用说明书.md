@@ -82,9 +82,13 @@ streamlit run app.py
   示例：`py:{'A股':'A股','港股':'港股','美股':'美股','新三板':'新三板'}.get(record.get('data', {}).get('stock_type',''),'未知')` → `data.comType`
   示例：`py:{'1':'电子信息','2':'高端软件'}.get(sing_industry_line,'未分类')` → `data.industry_label`
 
-- 5 常规 py 表达式：`py:...`（内置 `str/int/float/len/round/re/json/__date_ts__`，上下文 `record`）
+- 5 常规 py 表达式：`py:...`（内置 `str/int/float/len/round/re/json/__date_ts__/__sql_list__`，上下文 `record`）
   示例：`py:' '.join(t.get('name','') for t in json.loads(record.get('data', {}).get('tags','[]') or '[]'))` → `data.tags_text`
   示例：`py:__date_ts__('2025-08-21')` → `data.qcc_update_ts`
+  示例：将逗号分隔的用户ID映射为昵称：
+  `target_paths=data.i5ehr5t4wg,data.i5ehr5t4wg_label`，
+  `rule=record.i5ehr5t4wg || py:__sql_list__('sys_user','user_id', record.i5ehr5t4wg, 'nick_name')`
+  说明：`__sql_list__` 会为每个ID在 `sys_user.sql` 中以 `user_id` 查询 `nick_name` 并用逗号拼接；若某个ID未命中，则保留该ID原值。
 
 - 6 sql.table(cond).field：从源 SQL 文件查字段（大小写与空格不敏感）
   示例：`sql.ct_company_info(usci=record.usci).stock_number` → `data.i5gpfj8y88`
@@ -126,3 +130,19 @@ streamlit run app.py
 5.完成后进行入库操作
 
 6.入库后的mysql可以根据自己的需求转出到其他地方，目前的思路是通过导出为sql文件，然后经过py脚本对差异字段进行处理后，入库到瀚高的pepm数据库中。
+
+### 表单转换入库：流程类型（flowDefineName）
+
+- "合伙协议" → `ct_partner_agreement` → 目标 `hhxy`
+- "业务审批" → `ct_fund_meet_manage` → 目标 `ywsp`
+- "股权直投业务审批" → `ct_project_meet_manage` → 目标 `gqztywsp`
+- "其他流程" → `ct_agreement_other` → 目标 `qtlc`
+- "项目合规性审查" → `ct_project_base_info` → 目标 `xmhgxsc`
+- "募集协议审批流程" → `ct_fund_raise_agmt` → 目标 `mjxysplc`
+- "基金出资记录" → `ct_invest_record` → 目标 `jjczjl2`
+- "股权直投，其他协议" → `ct_project_agreement_other` → 目标 `gqztqtxy`
+- "托管协议流程审批" → `ct_fund_custody_agmt` → 目标 `tgxylcsp`
+- "项目退出" → `ct_fund_quit_record` → 目标 `xmtc2`
+- "会议管理审批流程" → `ct_meeting_manage` → 目标 `hyglsplc`
+
+说明：上述映射维护在 `mapping_config.db` 的 `flow_entity_map` 表中，可通过界面或后台方法进行增删改（backend/db.py:117-151）。

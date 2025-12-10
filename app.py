@@ -16,7 +16,8 @@ from backend.db import (
     export_all, import_all,
     rename_table_target_entity,
     list_table_targets,
-    get_flow_entity_map, upsert_flow_entity_map
+    get_flow_entity_map, upsert_flow_entity_map, list_flow_entity_maps,
+    list_file_mappings, upsert_file_mapping, delete_file_mapping
 )
 from backend.source_fields import detect_source_fields, detect_sql_path,detect_field_comments, detect_table_title
 from backend.mapper_core import apply_record_mapping, check_entity_status, import_table_data, delete_table_data, clear_sql_cache, _parse_sql_file, _extract_entity_meta, _upsert_entity_row
@@ -420,7 +421,11 @@ def _build_instance_json(proc_inst_id: str) -> Dict[str, Any]:
     run_tasks = _pick_cols(ru_task, ["id_","name_","assignee_","owner_","create_time_","due_date_","category_","priority_","proc_inst_id_"])
     run_execs = _pick_cols(ru_exec, ["id_","parent_id_","super_exec_","act_id_","is_active_","is_concurrent_","is_scope_","proc_inst_id_"])
     # 历史任务与节点轨迹精选字段
-    hist_tasks = _pick_cols(hi_task, ["id_","task_id_","name_","assignee_","start_time_","end_time_","proc_inst_id_"])
+    hist_tasks = _pick_cols(hi_task, [
+        "id_","task_id_","name_","assignee_","owner_",
+        "start_time_","end_time_","duration_",
+        "delete_reason_","proc_inst_id_","parent_task_id_"
+    ])
     hist_acts  = _pick_cols(hi_act,  ["id_","act_id_","act_name_","assignee_","start_time_","end_time_","task_id_","proc_inst_id_"])
 
     # 抄送记录精选字段
@@ -514,6 +519,7 @@ def _build_instance_json(proc_inst_id: str) -> Dict[str, Any]:
         if not t:
             return {}
         keys = [
+            "id_","parent_task_id_",
             "name_","assignee_","owner_","start_time_","end_time_",
             "duration_","priority_","category_","delete_reason_",
         ]
@@ -596,6 +602,16 @@ def _build_instance_json(proc_inst_id: str) -> Dict[str, Any]:
         })
         i = j if j > i else i + 1
 
+    # 任务ID → 最近一条批注
+    comments_by_task = {}
+    try:
+        tids = {str(t.get("id_","")) for t in hi_task if t.get("id_")}
+        for tid in tids:
+            cs = [c for c in hi_cmts if str(c.get("task_id_","")) == tid]
+            comments_by_task[tid] = _last_comment(cs)
+    except Exception:
+        comments_by_task = {}
+
     out = {
         "procInstId": pid,
         "procDefId": def_id,
@@ -625,6 +641,7 @@ def _build_instance_json(proc_inst_id: str) -> Dict[str, Any]:
             "tasks": hist_tasks,
             "activities": hist_acts,
             "variables": hist_vars,
+            "comments_by_task": comments_by_task,
         },
         "copies": copy_rows,
         "pipeline": pipeline,
@@ -1016,8 +1033,76 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
         nds_sorted.append(nd)
     if not nds_sorted and nodes_src:
         nds_sorted = nodes_src
-    nds_sorted.sort(key=lambda n: _ts_num((n.get("task") or {}).get("end_time_") or n.get("end", "") or (n.get("task") or {}).get("start_time_") or n.get("start", "")), reverse=True)
-    for i, nd in enumerate(nds_sorted):
+    # 排序：从新到旧（开始时间优先，降序）
+    nds_sorted.sort(key=lambda n: _ts_num((n.get("task") or {}).get("start_time_") or n.get("start", "") or (n.get("task") or {}).get("end_time_") or n.get("end", "")), reverse=True)
+    # 追加未出现在节点中的纯任务（如仅在 act_hi_taskinst 存在的子任务）
+    hist_tasks_list = (data.get("history", {}) or {}).get("tasks", []) or []
+    present_ids = {str(((nd.get("task") or {}).get("id_")) or "").strip() for nd in nds_sorted}
+    extra_nodes = []
+    cm_map = ((data.get("history", {}) or {}).get("comments_by_task", {}) or {})
+    for ht in hist_tasks_list:
+        tid = str(ht.get("id_") or "").strip()
+        if not tid or tid in present_ids:
+            continue
+        extra_nodes.append({
+            "id": ht.get("task_id_", ""),
+            "type": "userTask",
+            "name": ht.get("name_", ""),
+            "assignee": ht.get("assignee_", ""),
+            "start": ht.get("start_time_", ""),
+            "end": ht.get("end_time_", ""),
+            "duration": ht.get("duration_", ""),
+            "lastComment": cm_map.get(tid, {}) or {},
+            "task": {
+                "id_": ht.get("id_", ""),
+                "parent_task_id_": ht.get("parent_task_id_", ""),
+                "name_": ht.get("name_", ""),
+                "assignee_": ht.get("assignee_", ""),
+                "owner_": ht.get("owner_", ""),
+                "start_time_": ht.get("start_time_", ""),
+                "end_time_": ht.get("end_time_", ""),
+                "duration_": ht.get("duration_", ""),
+                "priority_": ht.get("priority_", ""),
+                "category_": ht.get("category_", ""),
+                "delete_reason_": ht.get("delete_reason_", ""),
+            },
+            "value": {},
+            "actor_ids": [str(ht.get("assignee_", ""))],
+            "next": {},
+        })
+    if extra_nodes:
+        nds_sorted.extend(extra_nodes)
+        nds_sorted = _enrich_nodes_with_user(nds_sorted)
+    # 父子任务展示：优先展示父任务，再展示其子任务
+    task_map = {}
+    for nd in nds_sorted:
+        t = nd.get("task") or {}
+        tid = str(t.get("id_") or "").strip()
+        if tid:
+            task_map[tid] = nd
+    from collections import defaultdict
+    children_map = defaultdict(list)
+    for nd in nds_sorted:
+        t = nd.get("task") or {}
+        p = str(t.get("parent_task_id_") or "").strip()
+        if p:
+            children_map[p].append(nd)
+    visited = set()
+
+    import re
+    def _split_msg(s: str):
+        s0 = (s or '').strip()
+        inline_extra = ''
+        suggest = ''
+        parts = re.split(r"[，,]?\s*(?:理由为|原因是)\s*[:：]", s0)
+        if len(parts) >= 2:
+            inline_extra = (parts[0] or '').strip().rstrip('，。')
+            suggest = (parts[1] or '').strip().rstrip('，。')
+            return inline_extra, suggest
+        suggest = s0
+        return inline_extra, suggest
+
+    def _fmt_block(nd: Dict[str, Any], label_child: bool = False):
         t = nd.get("task", {}) or {}
         lc = nd.get("lastComment", {}) or {}
         rawm = (str(lc.get('message') or '') + ' ' + str(t.get('delete_reason_') or '')).lower()
@@ -1037,34 +1122,22 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
         end_txt = _fmt_time(t.get('end_time_') or nd.get('end',''))
         dur_text = _fmt_duration_auto(t.get('duration_')) or _fmt_duration_auto(nd.get('duration'))
         msg = (lc.get('message') or '').strip()
-        import re
-        def _split_msg(s: str):
-            s0 = (s or '').strip()
-            inline_extra = ''
-            suggest = ''
-            parts = re.split(r"[，,]?\s*(?:理由为|原因是)\s*[:：]", s0)
-            if len(parts) >= 2:
-                inline_extra = (parts[0] or '').strip().rstrip('，。')
-                suggest = (parts[1] or '').strip().rstrip('，。')
-                return inline_extra, suggest
-            suggest = s0
-            return inline_extra, suggest
         inline_extra, suggest_text = _split_msg(msg)
         if (not any([assignee, start_txt, end_txt, (dur_text or ''), msg])) and (task_name in ('结束','')):
-            continue
-        nodes_md.append(f"**审批任务：{task_name}**")
+            return []
         status_text = ("审批通过" if mk=='🟢' else ("审批未通过" if mk=='🔴' else ""))
-        if (not str(meta_info.get('endTime','')).strip()) and i == 0 and mk == '⚪':
+        if (not str(meta_info.get('endTime','')).strip()) and mk == '⚪':
             status_text = "审批中"
-        status_line = f"{mk}{(inline_extra or status_text)}"
-        nodes_md.append(status_line)
-        nodes_md.append("")
+        # 单行状态：父任务用“审批任务：xxx”，子任务用“xxx→子任务”
+        header = (f"**审批任务：{task_name} {mk}{(inline_extra or status_text)}**" if not label_child
+                  else f"**{task_name}→子任务 {mk}{(inline_extra or status_text)}**")
+        out = [header, ""]
         av = str(nd.get("assignee_val") or "").strip()
         dp = str(nd.get("dept") or "").strip()
         disp = (f"{av}（{dp}）" if av and dp else (av or assignee))
         if disp:
-            nodes_md.append(f"审批人：{disp}")
-            nodes_md.append("")
+            out.append(f"审批人：{disp}")
+            out.append("")
         line = []
         if start_txt:
             line.append(f"创建时间：{start_txt}")
@@ -1073,10 +1146,33 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
         if dur_text:
             line.append(f"耗时： {dur_text}")
         if line:
-            nodes_md.append(" ".join(line))
-            nodes_md.append("")
-        nodes_md.append(f"审批建议：{suggest_text}" if suggest_text else "审批建议：")
-        nodes_md.append("")
+            out.append(" ".join(line))
+            out.append("")
+        out.append(f"审批建议：{suggest_text}" if suggest_text else "审批建议：")
+        out.append("")
+        return out
+
+    for nd in nds_sorted:
+        t = nd.get("task", {}) or {}
+        tid = str(t.get("id_") or "").strip()
+        if not tid or tid in visited:
+            continue
+        parent_id = str(t.get("parent_task_id_") or "").strip()
+        if parent_id:
+            pnd = task_map.get(parent_id)
+            if pnd and str((pnd.get('task') or {}).get('id_') or '').strip() not in visited:
+                nodes_md.extend(_fmt_block(pnd, label_child=False))
+                visited.add(str((pnd.get('task') or {}).get('id_') or '').strip())
+            nodes_md.extend(_fmt_block(nd, label_child=True))
+            visited.add(tid)
+            continue
+        nodes_md.extend(_fmt_block(nd, label_child=False))
+        visited.add(tid)
+        for ch in children_map.get(tid, []):
+            ctid = str((ch.get('task') or {}).get('id_') or '').strip()
+            if ctid and ctid not in visited:
+                nodes_md.extend(_fmt_block(ch, label_child=True))
+                visited.add(ctid)
     hs_raw = str(hist.get('taskStatus','')).strip()
     code_map = {
         '0':'待审批','1':'审批中','2':'审批通过','3':'审批不通过','4':'已取消','5':'已回退','6':'委派中','7':'审批通过中','8':'自动抄送'
@@ -1114,7 +1210,9 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
         fields_obj["__name__"] = biz_name
     type_name = (type_override or entity or tbl or fdef or "flow_instance")
     fields_obj["name"] = biz_name
-    fields_obj["bt"] = biz_name
+    # 仅针对流程入库：当映射未提供 bt 或为空时，用 businessName 填充
+    if not str(fields_obj.get("bt", "")).strip():
+        fields_obj["bt"] = biz_name
     fields_obj["type"] = type_name
     key_field = "id"
     key_val = fields_obj.get("id") or (used_match or {}).get("id") or str(pid or "")
@@ -1879,7 +1977,9 @@ def render_flow_mgmt():
         kw = st.text_input("关键词（实例ID/业务键/定义编码）", key="form_conv_kw")
         code_filter = st.text_input("按定义编码过滤（如 ContractApproval）", key="form_conv_code")
         rows = _build_instance_rows()
-        flow_names = sorted({r.get("flow_define_name","") for r in rows if r.get("flow_define_name")})
+        flow_names_inst = {r.get("flow_define_name","") for r in rows if r.get("flow_define_name")}
+        flow_names_cfg = {x.get("flow_define_name","") for x in list_flow_entity_maps()}
+        flow_names = sorted({s for s in (flow_names_inst | flow_names_cfg) if s})
         flow_filter = st.selectbox("按流程名称过滤（flowDefineName）", options=["全部"] + flow_names, index=0, key="form_conv_flowname")
         def _match(r):
             s = (kw or "").strip().lower()
@@ -2062,7 +2162,9 @@ def render_flow_mgmt():
     with super_tabs[1]:
         st.subheader("表单转换入库")
         rows = _build_instance_rows()
-        flow_names = sorted({r.get("flow_define_name","") for r in rows if r.get("flow_define_name")})
+        flow_names_inst = {r.get("flow_define_name","") for r in rows if r.get("flow_define_name")}
+        flow_names_cfg = {x.get("flow_define_name","") for x in list_flow_entity_maps()}
+        flow_names = sorted({s for s in (flow_names_inst | flow_names_cfg) if s})
         flow_sel = st.selectbox("流程类型(flowDefineName)", options=flow_names or [""])
         def _match_flow(r):
             return str(r.get("flow_define_name","")) == str(flow_sel)
@@ -2281,19 +2383,85 @@ def render_flow_mgmt():
                 nds_sorted.append(nd)
             if not nds_sorted and nodes_src:
                 nds_sorted = nodes_src
-            nds_sorted.sort(key=lambda n: _ts_num((n.get("task") or {}).get("end_time_") or n.get("end", "") or (n.get("task") or {}).get("start_time_") or n.get("start", "")), reverse=True)
-            for i, nd in enumerate(nds_sorted):
+            # 排序：从新到旧（开始时间优先，降序）
+            nds_sorted.sort(key=lambda n: _ts_num((n.get("task") or {}).get("start_time_") or n.get("start", "") or (n.get("task") or {}).get("end_time_") or n.get("end", "")), reverse=True)
+            hist_tasks_list = (data.get("history", {}) or {}).get("tasks", []) or []
+            present_ids = {str(((nd.get("task") or {}).get("id_")) or "").strip() for nd in nds_sorted}
+            extra_nodes = []
+            cm_map = ((data.get("history", {}) or {}).get("comments_by_task", {}) or {})
+            for ht in hist_tasks_list:
+                tid = str(ht.get("id_") or "").strip()
+                if not tid or tid in present_ids:
+                    continue
+                extra_nodes.append({
+                    "id": ht.get("task_id_", ""),
+                    "type": "userTask",
+                    "name": ht.get("name_", ""),
+                    "assignee": ht.get("assignee_", ""),
+                    "start": ht.get("start_time_", ""),
+                    "end": ht.get("end_time_", ""),
+                    "duration": ht.get("duration_", ""),
+                    "lastComment": cm_map.get(tid, {}) or {},
+                    "task": {
+                        "id_": ht.get("id_", ""),
+                        "parent_task_id_": ht.get("parent_task_id_", ""),
+                        "name_": ht.get("name_", ""),
+                        "assignee_": ht.get("assignee_", ""),
+                        "owner_": ht.get("owner_", ""),
+                        "start_time_": ht.get("start_time_", ""),
+                        "end_time_": ht.get("end_time_", ""),
+                        "duration_": ht.get("duration_", ""),
+                        "priority_": ht.get("priority_", ""),
+                        "category_": ht.get("category_", ""),
+                        "delete_reason_": ht.get("delete_reason_", ""),
+                    },
+                    "value": {},
+                    "actor_ids": [str(ht.get("assignee_", ""))],
+                    "next": {},
+                })
+            if extra_nodes:
+                nds_sorted.extend(extra_nodes)
+                nds_sorted = _enrich_nodes_with_user(nds_sorted)
+                nds_sorted.sort(key=lambda n: _ts_num((n.get("task") or {}).get("start_time_") or n.get("start", "") or (n.get("task") or {}).get("end_time_") or n.get("end", "")), reverse=True)
+            # 父子任务展示：优先展示父任务，再展示其子任务（单行状态）
+            task_map = {}
+            for nd in nds_sorted:
+                t0 = nd.get("task") or {}
+                tid0 = str(t0.get("id_") or "").strip()
+                if tid0:
+                    task_map[tid0] = nd
+            from collections import defaultdict
+            children_map = defaultdict(list)
+            for nd in nds_sorted:
+                t0 = nd.get("task") or {}
+                p0 = str(t0.get("parent_task_id_") or "").strip()
+                if p0:
+                    children_map[p0].append(nd)
+            visited = set()
+            import re
+            def _split_msg(s: str):
+                s0 = (s or '').strip()
+                inline_extra = ''
+                suggest = ''
+                parts = re.split(r"[，,]?\s*(?:理由为|原因是)\s*[:：]", s0)
+                if len(parts) >= 2:
+                    inline_extra = (parts[0] or '').strip().rstrip('，。')
+                    suggest = (parts[1] or '').strip().rstrip('，。')
+                    return inline_extra, suggest
+                suggest = s0
+                return inline_extra, suggest
+            def _fmt_block(nd: Dict[str, Any], label_child: bool = False):
                 t = nd.get("task", {}) or {}
                 lc = nd.get("lastComment", {}) or {}
-                raw = (str(lc.get('message') or '') + ' ' + str(t.get('delete_reason_') or '')).lower()
+                rawm = (str(lc.get('message') or '') + ' ' + str(t.get('delete_reason_') or '')).lower()
                 mk = '⚪'
                 for kw in ['同意','通过','批准','审核通过']:
-                    if kw in raw:
+                    if kw in rawm:
                         mk = '🟢'
                         break
                 if mk == '⚪':
                     for kw in ['驳回','退回','拒绝','不通过','不同意']:
-                        if kw in raw:
+                        if kw in rawm:
                             mk = '🔴'
                             break
                 task_name = (t.get('name_') or nd.get('name','') or '').strip()
@@ -2302,54 +2470,21 @@ def render_flow_mgmt():
                 end_txt = _fmt_time(t.get('end_time_') or nd.get('end',''))
                 dur_text = _fmt_duration_auto(t.get('duration_')) or _fmt_duration_auto(nd.get('duration'))
                 msg = (lc.get('message') or '').strip()
-                def _split_msg(s: str):
-                    s0 = (s or '').strip()
-                    inline_extra = ''
-                    suggest = ''
-                    import re
-                    m = re.match(r"^\s*审批(通过|未通过)[，,]?\s*原因是[:：]\s*(.+)$", s0)
-                    if m:
-                        suggest = (m.group(2) or '').strip()
-                        return inline_extra, suggest
-                    parts = re.split(r"[，,]?\s*理由为[:：]", s0)
-                    if len(parts) >= 2:
-                        inline_extra = (parts[0] or '').strip().rstrip('，。')
-                        suggest = (parts[1] or '').strip().rstrip('，。')
-                        return inline_extra, suggest
-                    suggest = s0
-                    return inline_extra, suggest
-                def _split_msg(s: str):
-                    s0 = (s or '').strip()
-                    inline_extra = ''
-                    suggest = ''
-                    import re
-                    m = re.match(r"^\s*审批(通过|未通过)[，,]?\s*原因是[:：]\s*(.+)$", s0)
-                    if m:
-                        suggest = (m.group(2) or '').strip()
-                        return inline_extra, suggest
-                    parts = re.split(r"[，,]?\s*理由为[:：]", s0)
-                    if len(parts) >= 2:
-                        inline_extra = (parts[0] or '').strip().rstrip('，。')
-                        suggest = (parts[1] or '').strip().rstrip('，。')
-                        return inline_extra, suggest
-                    suggest = s0
-                    return inline_extra, suggest
                 inline_extra, suggest_text = _split_msg(msg)
                 if (not any([assignee, start_txt, end_txt, (dur_text or ''), msg])) and (task_name in ('结束','')):
-                    continue
-                nodes_md.append(f"**审批任务：{task_name}**")
+                    return []
                 status_text = ("审批通过" if mk=='🟢' else ("审批未通过" if mk=='🔴' else ""))
-                if (not str(meta_info.get('endTime','')).strip()) and i == 0 and mk == '⚪':
+                if (not str(meta_info.get('endTime','')).strip()) and mk == '⚪':
                     status_text = "审批中"
-                status_line = f"{mk}{(inline_extra or status_text)}"
-                nodes_md.append(status_line)
-                nodes_md.append("")
+                header = (f"**审批任务：{task_name} {mk}{(inline_extra or status_text)}**" if not label_child
+                          else f"**{task_name}→子任务 {mk}{(inline_extra or status_text)}**")
+                out = [header, ""]
                 av = str(nd.get("assignee_val") or "").strip()
                 dp = str(nd.get("dept") or "").strip()
                 disp = (f"{av}（{dp}）" if av and dp else (av or assignee))
                 if disp:
-                    nodes_md.append(f"审批人：{disp}")
-                    nodes_md.append("")
+                    out.append(f"审批人：{disp}")
+                    out.append("")
                 line = []
                 if start_txt:
                     line.append(f"创建时间：{start_txt}")
@@ -2358,10 +2493,32 @@ def render_flow_mgmt():
                 if dur_text:
                     line.append(f"耗时： {dur_text}")
                 if line:
-                    nodes_md.append(" ".join(line))
-                    nodes_md.append("")
-                nodes_md.append(f"审批建议：{suggest_text}" if suggest_text else "审批建议：")
-                nodes_md.append("")
+                    out.append(" ".join(line))
+                    out.append("")
+                out.append(f"审批建议：{suggest_text}" if suggest_text else "审批建议：")
+                out.append("")
+                return out
+            for nd in nds_sorted:
+                t = nd.get("task", {}) or {}
+                tid = str(t.get("id_") or "").strip()
+                if not tid or tid in visited:
+                    continue
+                parent_id = str(t.get("parent_task_id_") or "").strip()
+                if parent_id:
+                    pnd = task_map.get(parent_id)
+                    if pnd and str((pnd.get('task') or {}).get('id_') or '').strip() not in visited:
+                        nodes_md.extend(_fmt_block(pnd, label_child=False))
+                        visited.add(str((pnd.get('task') or {}).get('id_') or '').strip())
+                    nodes_md.extend(_fmt_block(nd, label_child=True))
+                    visited.add(tid)
+                    continue
+                nodes_md.extend(_fmt_block(nd, label_child=False))
+                visited.add(tid)
+                for ch in children_map.get(tid, []):
+                    ctid = str((ch.get('task') or {}).get('id_') or '').strip()
+                    if ctid and ctid not in visited:
+                        nodes_md.extend(_fmt_block(ch, label_child=True))
+                        visited.add(ctid)
             if not nodes_md:
                 for tsk in (data.get("runtime", {}) or {}).get("tasks", []) or []:
                     name_rt = (tsk.get("name_", "") or "").strip()
@@ -2774,7 +2931,60 @@ def render_flow_mgmt():
 def render_file_mgmt():
     st.title("📃 文件管理")
     render_top_tabs('file')
-    st.info("文件管理：在此统一管理静态资源与文档。")
+    st.info("文件管理：在此统一管理文件映射规则，并可预览映射效果。")
+
+    st.subheader("文件映射管理")
+    tabs = st.tabs(["映射列表", "新增映射", "预览解析示例"])
+
+    with tabs[0]:
+        kw = st.text_input("按源表过滤", key="file_map_kw")
+        all_maps = list_file_mappings()
+        view = [m for m in all_maps if (not kw or kw.strip() in (m.get("source_table") or ""))]
+        st.dataframe(view, use_container_width=True)
+        del_id = st.number_input("删除映射ID", value=0, step=1, key="file_map_del_id")
+        if st.button("删除", key="file_map_del_btn"):
+            if int(del_id) > 0:
+                ok = delete_file_mapping(int(del_id))
+                if ok:
+                    st.success("已删除映射")
+                    st.rerun()
+                else:
+                    st.error("删除失败")
+
+    with tabs[1]:
+        st.caption("根据指引：entity_field 与 (doc_uuid, doc_name) 不能同时存在")
+        src_tbl = st.selectbox("source_table", options=[r[0] for r in list_tables(include_disabled=True)], key="file_map_src_tbl")
+        src_field = st.text_input("source_field", key="file_map_src_field")
+        entity = st.selectbox("entity", options=[x.get("target_entity") or "" for x in list_mapped_tables()] + [""], key="file_map_entity")
+        entity_field = st.text_input("entity_field", key="file_map_entity_field")
+        doc_uuid = st.text_input("doc_uuid", key="file_map_doc_uuid")
+        doc_name = st.text_input("doc_name", key="file_map_doc_name")
+        desc = st.text_input("备注", key="file_map_desc")
+        order_idx = st.number_input("排序", value=0, step=1, key="file_map_order")
+        enabled = st.checkbox("启用", value=True, key="file_map_enabled")
+        if st.button("保存映射", key="file_map_save"):
+            ef = (entity_field or "").strip()
+            du, dn = (doc_uuid or "").strip(), (doc_name or "").strip()
+            if ef and (du or dn):
+                st.error("entity_field 与 doc_uuid/doc_name 不能同时填写")
+            elif not src_tbl or not src_field or not entity:
+                st.error("请填写 source_table、source_field、entity")
+            else:
+                ok = upsert_file_mapping(src_tbl, src_field, entity, ef, du, dn, desc, int(enabled), int(order_idx))
+                if ok:
+                    st.success("已保存映射")
+                    st.rerun()
+                else:
+                    st.error("保存失败")
+
+    with tabs[2]:
+        st.caption("从源 SQL 的文本字段解析 文件名@URL 列表，展示解析与分发示例")
+        demo_tbl = st.selectbox("选择源表", options=[r[0] for r in list_tables(include_disabled=True)], key="file_map_demo_tbl")
+        rows = _read_sql_rows(demo_tbl)
+        cols = st.text_input("打印字段（逗号分隔）", value="need,upload_files", key="file_map_demo_cols")
+        pick = [c.strip() for c in cols.split(",") if c.strip()]
+        st.json(_pick_cols(rows[:10], pick))
+        st.caption("解析规则：支持 '文件名@URL'，多个以逗号分隔；URL 中可解析日期片段作为存储路径维度")
 
 
 def render_user_dept_mgmt():

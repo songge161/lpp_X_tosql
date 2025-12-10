@@ -25,6 +25,7 @@ _CACHE: Dict[str, Any] = {}
 # 专用于 SQL 源文件解析的缓存（不随每条映射清空）
 _SQL_ROWS_CACHE: Dict[str, List[Dict[str, Any]]] = {}
 _SQL_IDX_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_SQL_FILE_MTIME: Dict[str, float] = {}
 
 COMPLEX_EXPR_RE = re.compile(
     r"(?P<etype>(entity|sql))\.(?P<table>\w+)\(\s*(?P<cond>.+?)\s*\)\.(?P<target>[\w\.]+)",
@@ -130,6 +131,42 @@ def __date_ts__(v) -> int:
         if s.isdigit():
             return int(int(s) // 1000 if int(s) > 1e12 else int(s))
     return int(time.time())
+
+def __date_any__(val):
+    import datetime, re
+    s = str(val or "").strip()
+    if not s:
+        return None
+    try:
+        if isinstance(val, (int, float)) or s.isdigit():
+            x = float(s) if s.isdigit() else float(val)
+            ms = int(x) if x >= 1e11 else int(x * 1000)
+            return datetime.datetime.fromtimestamp(ms / 1000.0)
+    except Exception:
+        pass
+    ss = s.replace("年","-").replace("月","-").replace("日","")
+    ss = ss.replace("/","-")
+    ss = ss.strip()
+    for f in ("%Y-%m-%d %H:%M:%S.%f","%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M","%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(ss.split(".")[0], f)
+        except Exception:
+            pass
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})", ss)
+    if m:
+        y = int(m.group(1)); mo = int(m.group(2)); d = 1
+        try:
+            return datetime.datetime(y, mo, d)
+        except Exception:
+            return None
+    m = re.fullmatch(r"(\d{4})", ss)
+    if m:
+        y = int(m.group(1)); mo = 1; d = 1
+        try:
+            return datetime.datetime(y, mo, d)
+        except Exception:
+            return None
+    return None
 # ================= 安全 Entity Fetch =================
 def _entity_fetch(type_name: str, where_field: str, where_val: Any, target_path: str) -> Optional[Any]:
     """安全的 entity 查询：未命中返回 None，不复用旧缓存。
@@ -259,14 +296,31 @@ def _sql_lookup(table: str, where_field: str, where_val: Any, target_field: str)
         tf = str(target_field or "").strip()
         tv = str(where_val or "").strip()
 
-        # 取 rows 缓存（不受 _CACHE.clear() 影响）
+        # 自动检测文件变更：若 SQL 文件已更新，则重建解析与索引缓存
+        p = detect_sql_path(table)
+        if not p.exists():
+            return None
+        cur_mtime = 0.0
+        try:
+            cur_mtime = float(p.stat().st_mtime)
+        except Exception:
+            cur_mtime = 0.0
+
+        last_mtime = _SQL_FILE_MTIME.get(table, -1.0)
+
+        # 取 rows 缓存（不受 _CACHE.clear() 影响）；若文件变更则强制重载
         rows = _SQL_ROWS_CACHE.get(table)
-        if rows is None:
-            p = detect_sql_path(table)
-            if not p.exists():
-                return None
+        if (rows is None) or (last_mtime < cur_mtime):
             rows = _parse_sql_file(p)
             _SQL_ROWS_CACHE[table] = rows
+            _SQL_FILE_MTIME[table] = cur_mtime
+            # 文件更新时，该表的所有字段索引均失效，需清理
+            keys_to_del = [k for k in _SQL_IDX_CACHE.keys() if k.startswith(f"{table}|")]
+            for k in keys_to_del:
+                try:
+                    del _SQL_IDX_CACHE[k]
+                except Exception:
+                    pass
 
         # 若该字段未建立索引，构建一次基于小写、去空格的索引
         idx_key = f"{table}|{wf}"
@@ -300,6 +354,11 @@ def clear_sql_cache(table: Optional[str] = None) -> Dict[str, int]:
         if table in _SQL_ROWS_CACHE:
             del _SQL_ROWS_CACHE[table]
             cleared_rows = 1
+        if table in _SQL_FILE_MTIME:
+            try:
+                del _SQL_FILE_MTIME[table]
+            except Exception:
+                pass
         # 删除该表的所有字段索引
         keys = [k for k in _SQL_IDX_CACHE.keys() if k.startswith(f"{table}|")]
         for k in keys:
@@ -310,6 +369,7 @@ def clear_sql_cache(table: Optional[str] = None) -> Dict[str, int]:
         cleared_idx = len(_SQL_IDX_CACHE)
         _SQL_ROWS_CACHE.clear()
         _SQL_IDX_CACHE.clear()
+        _SQL_FILE_MTIME.clear()
     return {"rows": cleared_rows, "idx": cleared_idx}
 
 def warm_sql_cache(tables: List[str]) -> Dict[str, int]:
@@ -420,6 +480,9 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
                     return dt.strftime(fmt)
                 except Exception:
                     continue
+            dt2 = __date_any__(val)
+            if dt2:
+                return dt2.strftime(fmt)
             return str(val).split(" ")[0]
         except Exception as e:
             print("[date(fmt, field) error]", e)
@@ -532,7 +595,14 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
                 },
                 "re": re,
                 "json": json,
-                "__date_ts__": __date_ts__
+                "__date_ts__": __date_ts__,
+                # 提供 SQL 查找辅助：单值与逗号分隔列表
+                "__sql_lookup__": _sql_lookup,
+                "__sql_list__": lambda tbl, wf, csv_vals, tf: 
+                    ",".join([
+                        str(_sql_lookup(tbl, wf, v.strip(), tf) or v.strip())
+                        for v in str(csv_vals or "").split(",") if v.strip()
+                    ])
             }
             val = eval(expr, safe_globals, {"record": rec_obj, **record})
             return val
@@ -645,7 +715,7 @@ def _assign_target(rec: Dict[str, Any], t: str, val: Any, name_holder=None):
 
 # ==================== SQL 解析 & 入库工具 ====================
 INSERT_RE = re.compile(
-    r"insert\s+into\s+public\.\"?(?P<table>[\w\u4e00-\u9fa5]+)\"?\s*\((?P<cols>[^)]*)\)\s*values\s*\((?P<vals>[^)]*)\)\s*;",
+    r"insert\s+into\s+public\.\"?(?P<table>[\w\u4e00-\u9fa5]+)\"?\s*\((?P<cols>[^)]*)\)\s*values\s*\((?P<vals>[\s\S]*?)\)\s*;",
     re.IGNORECASE
 )
 
@@ -678,6 +748,9 @@ def _parse_values(raw: str) -> List[Any]:
     def _norm(v):
         v = v.strip()
         if v.upper() == "NULL": return ""
+        # 兼容 Postgres 的 e'...'/E'...' 语法
+        if (v.lower().startswith("e'") and v.endswith("'")):
+            v = v[2:]
         if v.startswith("'") and v.endswith("'"):
             return v[1:-1].replace("''","'")
         return v
