@@ -6,6 +6,7 @@
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
       <excludeFolder url="file://$MODULE_DIR$/outer_packet" />
       <excludeFolder url="file://$MODULE_DIR$/source/sql" />
+      <excludeFolder url="file://$MODULE_DIR$/source/files" />
     </content>
     <orderEntry type="jdk" jdkName="Python 3.9 (FastAPIProject)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

@@ -69,6 +69,65 @@ def init_db():
         );
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS file_map_cfgs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_table TEXT,
+            source_field TEXT,
+            entity TEXT,
+            mode TEXT,
+            entity_field TEXT,
+            doc_uuid TEXT,
+            doc_name TEXT,
+            sql_field TEXT,
+            match_entity_field TEXT,
+            saved_at INTEGER,
+            status TEXT,
+            UNIQUE(source_table, source_field, entity, mode, entity_field, doc_uuid, doc_name)
+        );
+        """
+    )
+    try:
+        cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='file_map_cfgs'")
+        row = cur.fetchone()
+        ddl = row[0] if row else ""
+        if ddl and "UNIQUE(source_table, source_field, entity, mode, entity_field, doc_uuid, doc_name)" not in ddl:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute("ALTER TABLE file_map_cfgs RENAME TO file_map_cfgs_old")
+            cur.execute(
+                """
+                CREATE TABLE file_map_cfgs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_table TEXT,
+                    source_field TEXT,
+                    entity TEXT,
+                    mode TEXT,
+                    entity_field TEXT,
+                    doc_uuid TEXT,
+                    doc_name TEXT,
+                    sql_field TEXT,
+                    match_entity_field TEXT,
+                    saved_at INTEGER,
+                    status TEXT,
+                    UNIQUE(source_table, source_field, entity, mode, entity_field, doc_uuid, doc_name)
+                );
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO file_map_cfgs (id, source_table, source_field, entity, mode, entity_field, doc_uuid, doc_name, sql_field, match_entity_field, saved_at, status)
+                SELECT id, source_table, source_field, entity, mode, entity_field, doc_uuid, doc_name, sql_field, match_entity_field, saved_at, status
+                FROM file_map_cfgs_old
+                """
+            )
+            cur.execute("DROP TABLE file_map_cfgs_old")
+            conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
     conn.close()
 
 
@@ -173,6 +232,78 @@ def list_flow_entity_maps() -> List[Dict[str, str]]:
     rows = [{"flow_define_name": r[0], "source_table": r[1] or "", "target_entity": r[2] or ""} for r in cur.fetchall()]
     conn.close()
     return rows
+
+
+def upsert_file_map_cfg(cfg: Dict[str, Any]) -> int:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO file_map_cfgs (
+            source_table, source_field, entity, mode, entity_field, doc_uuid, doc_name, sql_field, match_entity_field, saved_at, status
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(source_table, source_field, entity, mode, entity_field, doc_uuid, doc_name)
+        DO UPDATE SET entity_field=excluded.entity_field, doc_uuid=excluded.doc_uuid, doc_name=excluded.doc_name,
+                      sql_field=excluded.sql_field, match_entity_field=excluded.match_entity_field,
+                      saved_at=excluded.saved_at, status=excluded.status
+        """,
+        (
+            cfg.get("source_table",""), cfg.get("source_field",""), cfg.get("entity",""), cfg.get("mode",""),
+            cfg.get("entity_field",""), cfg.get("doc_uuid") or "", cfg.get("doc_name") or "",
+            cfg.get("sql_field",""), cfg.get("match_entity_field",""), int(cfg.get("saved_at") or int(time.time())), cfg.get("status") or ""
+        )
+    )
+    conn.commit()
+    cur.execute(
+        "SELECT id FROM file_map_cfgs WHERE source_table=? AND source_field=? AND entity=? AND mode=? AND entity_field=? AND doc_uuid=? AND doc_name=?",
+        (cfg.get("source_table",""), cfg.get("source_field",""), cfg.get("entity",""), cfg.get("mode",""), cfg.get("entity_field",""), cfg.get("doc_uuid") or "", cfg.get("doc_name") or "")
+    )
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row else 0
+
+
+def list_file_map_cfgs() -> List[Dict[str, Any]]:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, source_table, source_field, entity, mode, entity_field, doc_uuid, doc_name, sql_field, match_entity_field, saved_at, status FROM file_map_cfgs ORDER BY saved_at DESC, id DESC")
+    rows = [
+        {
+            "id": int(r[0]),
+            "source_table": r[1] or "",
+            "source_field": r[2] or "",
+            "entity": r[3] or "",
+            "mode": r[4] or "",
+            "entity_field": r[5] or "",
+            "doc_uuid": r[6] or "",
+            "doc_name": r[7] or "",
+            "sql_field": r[8] or "",
+            "match_entity_field": r[9] or "",
+            "saved_at": int(r[10] or 0),
+            "status": r[11] or "",
+        }
+        for r in cur.fetchall()
+    ]
+    conn.close()
+    return rows
+
+
+def delete_file_map_cfg_by_id(cfg_id: int) -> bool:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM file_map_cfgs WHERE id=?", (int(cfg_id),))
+    conn.commit()
+    ok = cur.rowcount > 0
+    conn.close()
+    return ok
+
+
+def update_file_map_status(cfg_id: int, status: str) -> None:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE file_map_cfgs SET status=? WHERE id=?", (status or "", int(cfg_id)))
+    conn.commit()
+    conn.close()
 
 
 def save_table_mapping(source_table: str, target_entity: str, priority: int = 0, desc: str = ""):

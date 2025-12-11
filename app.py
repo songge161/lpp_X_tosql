@@ -16,8 +16,7 @@ from backend.db import (
     export_all, import_all,
     rename_table_target_entity,
     list_table_targets,
-    get_flow_entity_map, upsert_flow_entity_map, list_flow_entity_maps,
-    list_file_mappings, upsert_file_mapping, delete_file_mapping
+    get_flow_entity_map, upsert_flow_entity_map, list_flow_entity_maps
 )
 from backend.source_fields import detect_source_fields, detect_sql_path,detect_field_comments, detect_table_title
 from backend.mapper_core import apply_record_mapping, check_entity_status, import_table_data, delete_table_data, clear_sql_cache, _parse_sql_file, _extract_entity_meta, _upsert_entity_row
@@ -25,9 +24,23 @@ from backend.sql_utils import update_runtime_db, current_cfg
 from backend.presets import init_presets_db, list_presets, save_preset, delete_preset, get_last_runtime, save_last_runtime
 
 try:
-    from version3 import SID
+    from version3 import SID, uuid as gen_uuid10
 except Exception:
     SID = "default_sid"
+    import time, random, os
+    def gen_uuid10():
+        t = int(time.time()) % 1000
+        us = int(time.time() * 1e6) % 100
+        pid = os.getpid() % 100
+        rnd = random.randint(0, 46655)
+        n = (t << 24) | (us << 16) | (pid << 8) | (rnd & 0xFF)
+        chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+        s = ""; x = n
+        while x:
+            x, r = divmod(x, 36)
+            s = chars[r] + s
+        s = (s or "0") + "".join(chars[random.randint(0,35)] for _ in range(3))
+        return s[-10:].rjust(10, "0")
 
 st.set_page_config(page_title="表映射管理工具", layout="wide")
 init_db()
@@ -2931,60 +2944,689 @@ def render_flow_mgmt():
 def render_file_mgmt():
     st.title("📃 文件管理")
     render_top_tabs('file')
-    st.info("文件管理：在此统一管理文件映射规则，并可预览映射效果。")
-
+    sid = st.session_state.get("current_sid", SID)
     st.subheader("文件映射管理")
-    tabs = st.tabs(["映射列表", "新增映射", "预览解析示例"])
-
-    with tabs[0]:
-        kw = st.text_input("按源表过滤", key="file_map_kw")
-        all_maps = list_file_mappings()
-        view = [m for m in all_maps if (not kw or kw.strip() in (m.get("source_table") or ""))]
-        st.dataframe(view, use_container_width=True)
-        del_id = st.number_input("删除映射ID", value=0, step=1, key="file_map_del_id")
-        if st.button("删除", key="file_map_del_btn"):
-            if int(del_id) > 0:
-                ok = delete_file_mapping(int(del_id))
-                if ok:
-                    st.success("已删除映射")
-                    st.rerun()
-                else:
-                    st.error("删除失败")
-
-    with tabs[1]:
-        st.caption("根据指引：entity_field 与 (doc_uuid, doc_name) 不能同时存在")
-        src_tbl = st.selectbox("source_table", options=[r[0] for r in list_tables(include_disabled=True)], key="file_map_src_tbl")
-        src_field = st.text_input("source_field", key="file_map_src_field")
-        entity = st.selectbox("entity", options=[x.get("target_entity") or "" for x in list_mapped_tables()] + [""], key="file_map_entity")
-        entity_field = st.text_input("entity_field", key="file_map_entity_field")
-        doc_uuid = st.text_input("doc_uuid", key="file_map_doc_uuid")
-        doc_name = st.text_input("doc_name", key="file_map_doc_name")
-        desc = st.text_input("备注", key="file_map_desc")
-        order_idx = st.number_input("排序", value=0, step=1, key="file_map_order")
-        enabled = st.checkbox("启用", value=True, key="file_map_enabled")
-        if st.button("保存映射", key="file_map_save"):
-            ef = (entity_field or "").strip()
-            du, dn = (doc_uuid or "").strip(), (doc_name or "").strip()
-            if ef and (du or dn):
-                st.error("entity_field 与 doc_uuid/doc_name 不能同时填写")
-            elif not src_tbl or not src_field or not entity:
-                st.error("请填写 source_table、source_field、entity")
+    cols = st.columns([2,2,2,2])
+    mapped_rows = list_mapped_tables()
+    opts = []
+    for r in mapped_rows:
+        cnt = check_entity_status(r.get("target_entity",""), sid=sid)
+        if cnt > 0:
+            opts.append({"src": r.get("source_table",""), "ent": r.get("target_entity",""), "cnt": cnt})
+    labels = [f"{o['src']} ({o['ent']},{o['cnt']})" for o in opts] or [p.stem for p in Path("source/sql").glob("*.sql")]
+    with cols[0]:
+        sel_label = st.selectbox("source_table", options=labels, index=0 if labels else None)
+        src_table = (sel_label.split(" ")[0] if labels else sel_label)
+    with cols[1]:
+        src_field = st.text_input("source_field", value="upload_files")
+    with cols[2]:
+        # 从标签解析实体类型（严格取括号内第一个逗号前的内容）
+        def_ent = "fund"
+        try:
+            if "(" in sel_label and ")" in sel_label:
+                inner = sel_label.split("(", 1)[1].split(")", 1)[0]
+                def_ent = inner.split(",", 1)[0].strip()
+        except Exception:
+            def_ent = next((o["ent"] for o in opts if sel_label.startswith(o["src"])), "fund") if labels else "fund"
+        entity_type = st.text_input("entity", value=def_ent, key=f"filemap_entity_{sel_label}")
+    with cols[3]:
+        sql_field = st.text_input("sql_field", value="id")
+    match_cols = st.columns([1,1])
+    with match_cols[0]:
+        match_entity_field = st.text_input("匹配的entity_field", value="id")
+    with match_cols[1]:
+        st.caption("匹配规则：entity.data[匹配的entity_field] == 记录[sql_field]")
+    mode = st.radio("写入模式", options=["数据字段", "文档目录"], index=0, horizontal=True)
+    ef_col = st.columns([2,2])
+    if mode == "数据字段":
+        with ef_col[0]:
+            entity_field = st.text_input("entity_field", value="fjsc")
+        doc_uuid = ""
+        doc_name = ""
+    else:
+        with ef_col[0]:
+            doc_uuid = st.text_input("doc_uuid", value="")
+        with ef_col[1]:
+            doc_name = st.text_input("doc_name", value="")
+        entity_field = ""
+    def _parse_files(val: str):
+        items = []
+        for part in [x.strip() for x in str(val or "").split(",") if x.strip()]:
+            raw_name, raw_url = (part.split("@", 1) + [""])[:2]
+            url = raw_url.strip()
+            fname = ""
+            if url:
+                tail = url.rsplit("/", 1)[-1].strip()
+                fname = tail or ""
+            if not fname:
+                fname = raw_name.strip() or "unnamed"
+            # 名称不包含后缀；类型为后缀
+            if "." in fname:
+                base = ".".join(fname.split(".")[:-1])
+                ext = fname.split(".")[-1]
             else:
-                ok = upsert_file_mapping(src_tbl, src_field, entity, ef, du, dn, desc, int(enabled), int(order_idx))
-                if ok:
-                    st.success("已保存映射")
-                    st.rerun()
-                else:
-                    st.error("保存失败")
+                base, ext = fname, ""
+            m = re.search(r"/(\d{8})/", url)
+            yyyymm = (m.group(1)[:6] if m else time.strftime("%Y%m"))
+            items.append({"name": base, "url": url, "yyyymm": yyyymm, "ext": ext})
+        return items
+    def _build_file_row(eid: str, it: Dict[str, Any], fuid: str):
+        rel = f"../upload/files/{sid}/{it['yyyymm']}/{fuid}/{fuid}"
+        data = json.dumps({"path": None}, ensure_ascii=False)
+        def _resolve_config_uid() -> str:
+            if mode != "文档目录":
+                return "root"
+            cid = ((doc_uuid or "").strip() or "mahndrn6w7")
+            name = (doc_name or "").strip()
+            if not name:
+                return "root"
+            uid_val = "root"
+            try:
+                from backend.sql_utils import get_conn
+                conn = get_conn()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT data FROM entity WHERE uuid=%s LIMIT 1", (cid,))
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            try:
+                                cfg = json.loads(row[0])
+                            except Exception:
+                                cfg = {}
+                            items = {}
+                            if isinstance(cfg, dict):
+                                items = cfg.get("item") or (cfg.get("data") or {}).get("item") or {}
+                            if isinstance(items, dict):
+                                for key, meta in items.items():
+                                    nm = str((meta or {}).get("name", "")).strip()
+                                    if nm == name:
+                                        uid_val = str((meta or {}).get("key") or (meta or {}).get("id") or key)
+                                        break
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+            if uid_val == "root":
+                try:
+                    from pathlib import Path
+                    txt = Path("outer_packet/config_data.json").read_text(encoding="utf-8")
+                    cfg2 = json.loads(txt)
+                    items2 = (cfg2.get("item") or {}) if isinstance(cfg2, dict) else {}
+                    for key, meta in items2.items():
+                        nm = str((meta or {}).get("name", "")).strip()
+                        if nm == name:
+                            uid_val = str((meta or {}).get("key") or (meta or {}).get("id") or key)
+                            break
+                except Exception:
+                    pass
+            return uid_val
+        uid = _resolve_config_uid()
+        cid_val = (None if mode=="数据字段" else ((doc_uuid or "").strip() or "mahndrn6w7"))
+        path = json.dumps({"config": {"cid": cid_val, "uid": uid}, "eid": eid}, ensure_ascii=False)
+        quote = json.dumps({"mod": {eid: ([entity_field] if entity_field else [])}}, ensure_ascii=False) if mode=="数据字段" else ""
+        now_ts = int(time.time())
+        ext = it.get("ext", "")
+        def _infra_find_by_filename(full_name: str):
+            try:
+                rows = _read_sql_rows("infra_file")
+                for r in rows:
+                    if str(r.get("name","")) == full_name:
+                        return r
+            except Exception:
+                return None
+            return None
+        def _usr_uuid_by_source_id(src_id: str):
+            from backend.sql_utils import get_conn, json_equals_clause
+            conn = get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT uuid FROM usr WHERE {json_equals_clause('data','source_id')} LIMIT 1",
+                        (str(src_id or ""),)
+                    )
+                    row = cur.fetchone()
+                    return (row[0] if row else None)
+            except Exception:
+                return None
+            finally:
+                conn.close()
+        full_name = it.get("name","") + (f".{ext}" if ext else "")
+        infra = _infra_find_by_filename(full_name)
+        c_uuid = None
+        u_uuid = None
+        usr_update_epoch = None
+        if infra:
+            c_uuid = _usr_uuid_by_source_id(infra.get("creator"))
+            u_uuid = _usr_uuid_by_source_id(infra.get("updater"))
+            ts = str(infra.get("update_time") or "")
+            try:
+                from datetime import datetime
+                usr_update_epoch = int(datetime.strptime(ts.split(".")[0], "%Y-%m-%d %H:%M:%S").timestamp())
+            except Exception:
+                usr_update_epoch = None
+        return {
+            "uuid": fuid, "name": it["name"], "file": rel, "doc_type": entity_type,
+            "flag": "", "size": 0, "data": data, "path": path, "quote": quote,
+            "sid": sid, "eid": eid, "type": ext, "uid": uid,
+            "create_people": (c_uuid or "root"), "create_date": now_ts, "update_people": (u_uuid or "root"), "update_date": (usr_update_epoch or now_ts),
+            "del": 0, "state": 0, "filecrypt": 0, "oss": 0, "privilege": ""
+            , "_usr_update_epoch": usr_update_epoch
+        }
+    def _save_local_file(it: Dict[str, Any], fuid: str):
+        import os, shutil
+        base = Path("/Users/songyihong/PEPM/lpp/upload/files") / sid / it["yyyymm"] / fuid
+        base.mkdir(parents=True, exist_ok=True)
+        ext = it.get("ext", "")
+        dst_path = base / (fuid + (f".{ext}" if ext else ""))
+        size = 0
+        try:
+            src_path = _find_local_file(it.get("name",""), ext)
+            if src_path:
+                shutil.copyfile(src_path, dst_path)
+                size = os.path.getsize(dst_path)
+            else:
+                open(dst_path, "wb").close()
+        except Exception:
+            try:
+                open(dst_path, "wb").close()
+            except Exception:
+                pass
+        return int(size)
+    def _write_files(rows: list):
+        from backend.sql_utils import get_conn
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                for r in rows:
+                    cur.execute(
+                        """
+                        INSERT INTO file (uuid,name,file,doc_type,flag,size,data,path,quote,sid,eid,type,uid,create_people,create_date,update_people,update_date,del,state,filecrypt,oss,privilege)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            r["uuid"], r["name"], r["file"], r["doc_type"], r["flag"], int(r["size"]), r["data"], r["path"], r["quote"],
+                            r["sid"], r["eid"], r["type"], r["uid"], r["create_people"], int(r["create_date"]), r["update_people"], int(r["update_date"]),
+                            int(r["del"]), int(r["state"]), int(r["filecrypt"]), int(r["oss"]), r["privilege"]
+                        )
+                    )
+            conn.commit()
+            return len(rows)
+        except Exception as e:
+            conn.rollback(); st.error(f"写入失败：{e}")
+            return 0
+        finally:
+            conn.close()
+    def _update_entity_files(eid: str, files: list):
+        from backend.mapper_core import update_entity_data_by_uuid
+        names = [((x.get("name") + ("." + x.get("type") if x.get("type") else ""))) for x in files]
+        uids = [x["uuid"] for x in files]
+        patch = {}
+        if entity_field:
+            patch[f"{entity_field}_upload"] = " ".join(names)
+            patch[f"{entity_field}_label"] = names
+            patch[f"{entity_field}"] = uids
+        return update_entity_data_by_uuid(eid, patch)
+    _LOCAL_FILE_INDEX = {}
+    def _find_local_file(name: str, ext: str) -> str:
+        from pathlib import Path
+        key = f"{name}.{ext}" if ext else name
+        if key in _LOCAL_FILE_INDEX:
+            return _LOCAL_FILE_INDEX[key]
+        base = Path("source/files")
+        try:
+            for p in base.rglob(key):
+                _LOCAL_FILE_INDEX[key] = str(p.resolve())
+                return _LOCAL_FILE_INDEX[key]
+        except Exception:
+            pass
+        _LOCAL_FILE_INDEX[key] = ""
+        return ""
+    def _show_file_preview(items: list):
+        if not items:
+            return
+        rows = []
+        for it in items:
+            name = it.get("name") or ""
+            ext = it.get("ext") or ""
+            local_path = _find_local_file(name, ext)
+            file_url = f"file://{local_path}" if local_path else ""
+            rows.append({"name": name, "type": ext, "file_url": file_url})
+        md = "| 文件名 | 类型 | 本地文件 |\n|---|---|---|\n"
+        for r in rows:
+            link = f"[{r['name']}]({r['file_url']})" if r["file_url"] else r["name"]
+            md += f"| {r['name']} | {r['type']} | {link} |\n"
+        st.markdown(md)
+    rec_cols = st.columns([2,1,1,1])
+    with rec_cols[0]:
+        rec_id = st.text_input("记录ID（仅处理该记录）", value="")
+    with rec_cols[1]:
+        preview_btn = st.button("解析预览", key="file_map_preview")
+    with rec_cols[2]:
+        write_preview_btn = st.button("写入预览", key="file_map_write_preview")
+    with rec_cols[3]:
+        apply_btn = st.button("一键写入", key="file_map_apply")
+    save_cfg_btn = st.button("保存映射配置", key="file_map_save")
+    if save_cfg_btn:
+        cfg = {
+            "source_table": src_table,
+            "source_field": src_field,
+            "entity": entity_type,
+            "mode": mode,
+            "entity_field": entity_field,
+            "doc_uuid": (doc_uuid if mode=="文档目录" else None),
+            "doc_name": (doc_name if mode=="文档目录" else None),
+            "sql_field": sql_field,
+            "match_entity_field": match_entity_field,
+            "saved_at": int(time.time()),
+            "status": "未入库",
+        }
+        from backend.db import upsert_file_map_cfg
+        cfg_id = upsert_file_map_cfg(cfg)
+        st.success(f"已保存到文件入库管理（配置ID：{cfg_id}）")
 
-    with tabs[2]:
-        st.caption("从源 SQL 的文本字段解析 文件名@URL 列表，展示解析与分发示例")
-        demo_tbl = st.selectbox("选择源表", options=[r[0] for r in list_tables(include_disabled=True)], key="file_map_demo_tbl")
-        rows = _read_sql_rows(demo_tbl)
-        cols = st.text_input("打印字段（逗号分隔）", value="need,upload_files", key="file_map_demo_cols")
-        pick = [c.strip() for c in cols.split(",") if c.strip()]
-        st.json(_pick_cols(rows[:10], pick))
-        st.caption("解析规则：支持 '文件名@URL'，多个以逗号分隔；URL 中可解析日期片段作为存储路径维度")
+    if preview_btn:
+        rows = _read_sql_rows(src_table)
+        view = rows
+        if rec_id:
+            view = [r for r in rows if str(r.get("id","")) == str(rec_id)]
+        show = []
+        from custom_handler import fetch_field_uuid
+        for r in view[:10]:
+            key_val = r.get(sql_field, "")
+            e_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
+            vs = _parse_files(r.get(src_field, ""))
+            show.append({"id": r.get("id"), "match_val": key_val, "entity_uuid": e_uuid, "count": len(vs), "first": (vs[0] if vs else {})})
+        st.dataframe(show, use_container_width=True)
+        try:
+            prv = []
+            for r in view[:3]:
+                prv.extend(_parse_files(r.get(src_field, "")))
+            _show_file_preview(prv[:12])
+        except Exception:
+            pass
+    if write_preview_btn:
+        rows = _read_sql_rows(src_table)
+        view = rows if not rec_id else [r for r in rows if str(r.get("id","")) == str(rec_id)]
+        if not view:
+            st.warning("未找到对应记录")
+        else:
+            from custom_handler import fetch_field_uuid
+            rows_preview = []
+            prv_items = []
+            for r in view:
+                key_val = r.get(sql_field, "")
+                e_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
+                src_val = str(r.get(src_field, "") or "")
+                items = _parse_files(src_val)
+                prv_items.extend(items)
+                for it in items:
+                    fuid = gen_uuid10()
+                    if e_uuid:
+                        file_row = _build_file_row(e_uuid, it, fuid)
+                        local_path = _find_local_file(file_row["name"], file_row["type"]) 
+                        file_url = f"file://{local_path}" if local_path else ""
+                        rows_preview.append({
+                            "record_id": r.get("id"),
+                            "entity_uuid": e_uuid,
+                            "uuid": file_row["uuid"],
+                            "name": file_row["name"],
+                            "type": file_row["type"],
+                            "uid": file_row["uid"],
+                            "path": file_row["path"],
+                            "doc_type": file_row["doc_type"],
+                            "file_url": file_url,
+                        })
+                    else:
+                        local_path = _find_local_file(it.get("name",""), it.get("ext",""))
+                        file_url = f"file://{local_path}" if local_path else ""
+                        rows_preview.append({
+                            "record_id": r.get("id"),
+                            "entity_uuid": None,
+                            "uuid": fuid,
+                            "name": it.get("name"),
+                            "type": it.get("ext"),
+                            "uid": None,
+                            "path": "",
+                            "doc_type": entity_type,
+                            "file_url": file_url,
+                        })
+            md = "| 记录ID | 实体UUID | 文件名 | 类型 | 目录UID | 本地文件 |\n|---|---|---|---|---|---|\n"
+            for r in rows_preview[:200]:
+                link = f"[{r.get('name','')}]({r.get('file_url','')})" if r.get("file_url") else r.get("name","")
+                md += f"| {r.get('record_id','')} | {r.get('entity_uuid','')} | {r.get('name','')} | {r.get('type','')} | {r.get('uid','')} | {link} |\n"
+            st.markdown(md)
+            try:
+                _show_file_preview(prv_items[:12])
+            except Exception:
+                pass
+    if apply_btn:
+        rows = _read_sql_rows(src_table)
+        view = rows if not rec_id else [r for r in rows if str(r.get("id","")) == str(rec_id)]
+        if not view:
+            st.warning("未找到对应记录")
+        else:
+            from custom_handler import fetch_field_uuid
+            all_files = []
+            files_by_eid = {}
+            total_items = 0
+            for r in view:
+                key_val = r.get(sql_field, "")
+                entity_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
+                if not entity_uuid:
+                    continue
+                src_val = str(r.get(src_field, "") or "")
+                items = _parse_files(src_val)
+                total_items += len(items)
+            prog = st.progress(0)
+            done = 0
+            for r in view:
+                key_val = r.get(sql_field, "")
+                entity_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
+                if not entity_uuid:
+                    continue
+                src_val = str(r.get(src_field, "") or "")
+                items = _parse_files(src_val)
+                for it in items:
+                    fuid = gen_uuid10()
+                    size = _save_local_file(it, fuid)
+                    row = _build_file_row(entity_uuid, it, fuid)
+                    row["size"] = size
+                    all_files.append(row)
+                    files_by_eid.setdefault(entity_uuid, []).append(row)
+                    done += 1
+                    if total_items:
+                        prog.progress(min(1.0, done/total_items))
+            if not all_files:
+                st.warning("无可写入的文件（可能实体未匹配或源字段为空）")
+            else:
+                n1 = _write_files(all_files)
+                try:
+                    from backend.sql_utils import get_conn
+                    conn = get_conn()
+                    try:
+                        with conn.cursor() as cur:
+                            for r in all_files:
+                                ts_epoch = r.get("_usr_update_epoch")
+                                if not ts_epoch:
+                                    continue
+                                for k in ("create_people","update_people"):
+                                    uu = r.get(k)
+                                    if uu and uu != "root":
+                                        try:
+                                            cur.execute("UPDATE usr SET update_date=%s WHERE uuid=%s", (int(ts_epoch), str(uu)))
+                                        except Exception:
+                                            continue
+                        conn.commit()
+                    finally:
+                        conn.close()
+                except Exception:
+                    pass
+                n2_total = 0
+                for eid, files in files_by_eid.items():
+                    n2_total += _update_entity_files(eid, files)
+                st.success(f"写入 file {n1} 条，更新 entity {n2_total} 条（本地路径：/Users/songyihong/PEPM/lpp/upload/files/{sid}/<YYYYMM>/<uuid>/）")
+    if st.button("刷新", key="file_map_refresh"):
+        st.rerun()
+
+    act_row2 = st.columns([1,1])
+    with act_row2[0]:
+        del_preview_btn = st.button("预览删除", key="file_del_preview")
+    with act_row2[1]:
+        del_apply_btn = st.button("一键删除", key="file_del_apply")
+    def _delete_entity_files(eid: str):
+        from backend.sql_utils import get_conn
+        import json, shutil
+        from pathlib import Path
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT uuid,file,sid FROM file WHERE eid=%s", (eid,))
+                rows = cur.fetchall() or []
+                uuids = []
+                paths = []
+                for r in rows:
+                    try:
+                        fuid = r[0]
+                        rel = r[1] or ""
+                        uuids.append(str(fuid))
+                        parts = str(rel).split("/")
+                        if len(parts) >= 7 and parts[0] == ".." and parts[1] == "upload" and parts[2] == "files":
+                            sid_v = parts[3]
+                            yyyymm_v = parts[4]
+                            fdir = parts[5]
+                            base = Path("/Users/songyihong/PEPM/lpp/upload/files") / sid_v / yyyymm_v / fdir
+                            paths.append(base)
+                    except Exception:
+                        continue
+                for p in paths:
+                    try:
+                        shutil.rmtree(p, ignore_errors=True)
+                    except Exception:
+                        pass
+                cur.execute("DELETE FROM file WHERE eid=%s", (eid,))
+                cur.execute("SELECT data FROM entity WHERE uuid=%s", (eid,))
+                erow = cur.fetchone()
+                if erow:
+                    now_ts = int(time.time())
+                    try:
+                        data = json.loads(erow[0] or "{}")
+                    except Exception:
+                        data = {}
+                    keys = list(data.keys())
+                    for k in keys:
+                        v = data.get(k)
+                        if k.endswith("_upload") or k.endswith("_label"):
+                            data.pop(k, None)
+                        elif isinstance(v, list) and all(isinstance(x, str) and len(x) == 10 for x in v):
+                            data.pop(k, None)
+                    cur.execute("UPDATE entity SET data=%s, update_date=%s WHERE uuid=%s", (json.dumps(data, ensure_ascii=False), now_ts, eid))
+            conn.commit()
+            return len(rows), len(paths)
+        except Exception as e:
+            conn.rollback(); st.error(f"删除失败：{e}")
+            return 0, 0
+        finally:
+            conn.close()
+    if del_preview_btn:
+        rows = _read_sql_rows(src_table)
+        view = rows if not rec_id else [r for r in rows if str(r.get("id","")) == str(rec_id)]
+        if not view:
+            st.warning("未找到对应记录")
+        else:
+            from custom_handler import fetch_field_uuid
+            summary = []
+            from backend.sql_utils import get_conn
+            conn = get_conn()
+            try:
+                with conn.cursor() as cur:
+                    for r in view:
+                        key_val = r.get(sql_field, "")
+                        e_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
+                        if not e_uuid:
+                            continue
+                        cur.execute("SELECT COUNT(1) FROM file WHERE eid=%s", (e_uuid,))
+                        row = cur.fetchone()
+                        c = row[0] if row else 0
+                        summary.append({"record_id": r.get("id"), "entity_uuid": e_uuid, "count": c})
+                if summary:
+                    md = "| 记录ID | 实体UUID | 待删除条数 |\n|---|---|---|\n"
+                    for s in summary:
+                        md += f"| {s['record_id']} | {s['entity_uuid']} | {s['count']} |\n"
+                    st.markdown(md)
+                else:
+                    st.info("无可删除的匹配实体")
+            finally:
+                conn.close()
+    if del_apply_btn:
+        rows = _read_sql_rows(src_table)
+        view = rows if not rec_id else [r for r in rows if str(r.get("id","")) == str(rec_id)]
+        if not view:
+            st.warning("未找到对应记录")
+        else:
+            from custom_handler import fetch_field_uuid
+            total_db = 0
+            total_fs = 0
+            for r in view:
+                key_val = r.get(sql_field, "")
+                e_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
+                if not e_uuid:
+                    continue
+                n_db, n_fs = _delete_entity_files(e_uuid)
+                total_db += n_db
+                total_fs += n_fs
+            if total_db or total_fs:
+                st.success(f"已删除 file {total_db} 条，并清理本地目录 {total_fs} 个；已清空匹配实体中的文件字段")
+            else:
+                st.info("无可删除的匹配实体")
+
+    st.subheader("📦 文件入库管理")
+    from backend.db import list_file_map_cfgs
+    cfgs = list_file_map_cfgs()
+    if not cfgs:
+        st.info("暂无保存的映射配置，可在上方点击‘保存映射配置’后使用此区域进行入库或删除。")
+    else:
+        def _cfg_label(c: dict) -> str:
+            base = f"{c['source_table']}.{c['source_field']} → {c['entity']}"
+            ef = str(c.get('entity_field') or '').strip()
+            if ef:
+                base += f".{ef}"
+            else:
+                dn = str(c.get('doc_name') or '').strip()
+                du = str(c.get('doc_uuid') or '').strip()
+                if dn and du:
+                    base += f"@{dn}（{du}）"
+                elif dn:
+                    base += f"@{dn}"
+                elif du:
+                    base += f"@{du}"
+            tail = f"（{c['mode']}）"
+            sqlf = str(c.get('sql_field') or '').strip()
+            matchf = str(c.get('match_entity_field') or '').strip()
+            etype = str(c.get('entity') or '').strip()
+            if sqlf or matchf:
+                tail += f"【sql.{sqlf or '-'}={etype}.data.{matchf or '-'}】"
+            return base + tail
+        options = [
+            {
+                "label": _cfg_label(c),
+                "id": c["id"],
+            }
+            for c in cfgs
+        ]
+        labels = [o["label"] for o in options]
+        sel = st.selectbox("选择入库配置", options=labels, index=0)
+        sel_id = next((o["id"] for o in options if o["label"] == sel), cfgs[0]["id"]) if options else 0
+        rec_id2 = st.text_input("记录ID（为空则全表）", key="file_imp_rec_id")
+        row1 = st.columns([1,1,1,1])
+        with row1[0]:
+            do_prev = st.button("入库预览", key="file_imp_prev")
+        with row1[1]:
+            do_apply = st.button("执行入库", key="file_imp_apply")
+        with row1[2]:
+            do_del = st.button("删除文件", key="file_imp_del")
+        with row1[3]:
+            do_rm_cfg = st.button("删除配置", key="file_imp_rm_cfg")
+
+        if do_prev or do_apply or do_del:
+            cfg = next((c for c in cfgs if c["id"] == sel_id), cfgs[0])
+            # 注入上下文供已有逻辑复用
+            mode = cfg.get("mode")
+            entity_field = cfg.get("entity_field") or ""
+            doc_uuid = cfg.get("doc_uuid") or ""
+            doc_name = cfg.get("doc_name") or ""
+            src_table = cfg.get("source_table")
+            src_field = cfg.get("source_field")
+            entity_type = cfg.get("entity")
+            sql_field = cfg.get("sql_field")
+            match_entity_field = cfg.get("match_entity_field")
+            rows = _read_sql_rows(src_table)
+            view = rows if not rec_id2 else [r for r in rows if str(r.get("id","")) == str(rec_id2)]
+            from custom_handler import fetch_field_uuid
+            if do_prev:
+                rows_preview = []
+                prv_items = []
+                for r in view:
+                    key_val = r.get(sql_field, "")
+                    e_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
+                    src_val = str(r.get(src_field, "") or "")
+                    items = _parse_files(src_val)
+                    prv_items.extend(items)
+                    for it in items:
+                        fuid = gen_uuid10()
+                        file_row = _build_file_row(e_uuid or "", it, fuid)
+                        file_url = ""
+                        local_path = _find_local_file(file_row["name"], file_row["type"]) 
+                        if local_path:
+                            file_url = f"file://{local_path}"
+                        rows_preview.append({
+                            "record_id": r.get("id"),
+                            "entity_uuid": e_uuid,
+                            "uuid": file_row["uuid"],
+                            "name": file_row["name"],
+                            "type": file_row["type"],
+                            "uid": file_row["uid"],
+                            "path": file_row["path"],
+                            "doc_type": file_row["doc_type"],
+                            "file_url": file_url,
+                        })
+                md = "| 记录ID | 实体UUID | 文件名 | 类型 | 目录UID | 本地文件 |\n|---|---|---|---|---|---|\n"
+                for r in rows_preview[:200]:
+                    link = f"[{r.get('name','')}]({r.get('file_url','')})" if r.get("file_url") else r.get("name","")
+                    md += f"| {r.get('record_id','')} | {r.get('entity_uuid','')} | {r.get('name','')} | {r.get('type','')} | {r.get('uid','')} | {link} |\n"
+                st.markdown(md)
+            if do_apply:
+                all_files = []
+                files_by_eid = {}
+                total_items = 0
+                for r in view:
+                    src_val = str(r.get(src_field, "") or "")
+                    total_items += len(_parse_files(src_val))
+                prog = st.progress(0)
+                done = 0
+                for r in view:
+                    key_val = r.get(sql_field, "")
+                    e_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
+                    if not e_uuid:
+                        continue
+                    src_val = str(r.get(src_field, "") or "")
+                    for it in _parse_files(src_val):
+                        fuid = gen_uuid10()
+                        size = _save_local_file(it, fuid)
+                        row = _build_file_row(e_uuid, it, fuid)
+                        row["size"] = size
+                        all_files.append(row)
+                        files_by_eid.setdefault(e_uuid, []).append(row)
+                        done += 1
+                        if total_items:
+                            prog.progress(min(1.0, done/total_items))
+                if not all_files:
+                    st.info("无可写入文件")
+                else:
+                    n1 = _write_files(all_files)
+                    n2_total = 0
+                    for eid, files in files_by_eid.items():
+                        n2_total += _update_entity_files(eid, files)
+                    from backend.db import update_file_map_status
+                    update_file_map_status(sel_id, f"已入库({n1})")
+                    st.success(f"入库完成：file {n1} 条，更新 entity {n2_total} 条")
+            if do_del:
+                total_db, total_fs = 0, 0
+                for r in view:
+                    key_val = r.get(sql_field, "")
+                    e_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
+                    if not e_uuid:
+                        continue
+                    n_db, n_fs = _delete_entity_files(e_uuid)
+                    total_db += n_db; total_fs += n_fs
+                st.success(f"已删除 file {total_db} 条，清理目录 {total_fs} 个")
+        if do_rm_cfg:
+            from backend.db import delete_file_map_cfg_by_id
+            ok = delete_file_map_cfg_by_id(sel_id)
+            if ok:
+                st.success("已删除配置")
+                st.rerun()
+            else:
+                st.info("未找到配置")
 
 
 def render_user_dept_mgmt():
@@ -3018,6 +3660,159 @@ def render_user_dept_mgmt():
             _DEPT_MAP = None
             _user_dept_maps()
             st.rerun()
+
+    st.subheader("用户入库")
+    imp_cols = st.columns([2,1,1,1,1,1])
+    with imp_cols[0]:
+        rec_id = st.text_input("记录ID（仅处理该记录）", key="usr_imp_rec_id")
+    with imp_cols[1]:
+        btn_preview = st.button("解析预览", key="usr_imp_preview")
+    with imp_cols[2]:
+        btn_write_preview = st.button("写入预览", key="usr_imp_write_preview")
+    with imp_cols[3]:
+        btn_apply = st.button("一键入库", key="usr_imp_apply")
+    with imp_cols[4]:
+        btn_del = st.button("一键删除", key="usr_imp_delete")
+    with imp_cols[5]:
+        btn_del_preview = st.button("预览删除", key="usr_imp_delete_preview")
+
+    def _gen_uuid11():
+        import random
+        chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+        try:
+            base = gen_uuid10()
+        except Exception:
+            base = "".join(random.choice(chars) for _ in range(10))
+        return base + random.choice(chars)
+
+    def _build_usr_row(sys_row: dict):
+        return {
+            "uuid": _gen_uuid11(),
+            "email": str(sys_row.get("user_name") or ""),
+            "pwd": "02b45e1b907d4dbe89d72c01fb5a5f5bd004f944",
+            "tel": None,
+            "name": str(sys_row.get("nick_name") or ""),
+            "sid": SID,
+            "data": json.dumps({"bool_c_p":0,"freeze_account":"否","pwd_error":0, "source_id": sys_row.get("user_id")}, ensure_ascii=False),
+            "belong_space": 1,
+        }
+
+    def _select_sys_users():
+        all_rows = _parse_all_inserts("sys_user")
+        if rec_id:
+            return [r for r in all_rows if str(r.get("user_id","")) == str(rec_id)]
+        return all_rows
+
+    def _write_usr(rows: list):
+        from backend.sql_utils import get_conn
+        conn = get_conn()
+        wrote = 0
+        try:
+            with conn.cursor() as cur:
+                for r in rows:
+                    cur.execute(
+                        """
+                        INSERT INTO usr (uuid,email,pwd,tel,name,sid,data,belong_space)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (r["uuid"], r["email"], r["pwd"], r["tel"], r["name"], r["sid"], r["data"], r["belong_space"])
+                    )
+                    wrote += 1
+            conn.commit()
+            return wrote
+        except Exception as e:
+            conn.rollback(); st.error(f"入库失败：{e}")
+            return wrote
+        finally:
+            conn.close()
+
+    def _delete_usr_by_sys_users():
+        from backend.sql_utils import get_conn
+        emails = [str(r.get("user_name") or "") for r in _select_sys_users()]
+        emails = [e for e in emails if e]
+        if not emails:
+            return 0
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                # 仅删除属于 sys_user 映射的邮箱
+                fmt = ",".join(["%s"]*len(emails))
+                cur.execute(f"DELETE FROM usr WHERE email IN ({fmt})", emails)
+            conn.commit()
+            return len(emails)
+        except Exception as e:
+            conn.rollback(); st.error(f"删除失败：{e}")
+            return 0
+        finally:
+            conn.close()
+
+    def _preview_delete_usr_by_sys_users():
+        from backend.sql_utils import get_conn
+        emails = [str(r.get("user_name") or "") for r in _select_sys_users()]
+        emails = [e for e in emails if e]
+        if not emails:
+            st.info("无匹配邮箱")
+            return
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                fmt = ",".join(["%s"]*len(emails))
+                cur.execute(f"SELECT uuid,email,name FROM usr WHERE email IN ({fmt})", emails)
+                rows = cur.fetchall() or []
+            show = []
+            for r in rows:
+                try:
+                    # pymysql 返回为元组；psycopg2 为元组；统一处理
+                    uu, em, nm = r[0], r[1], (r[2] if len(r) > 2 else "")
+                    show.append({"uuid": uu, "email": em, "name": nm})
+                except Exception:
+                    continue
+            st.dataframe(show[:200], use_container_width=True)
+            st.info(f"可删除 usr {len(show)} 条")
+        finally:
+            conn.close()
+
+    if btn_preview:
+        src = _select_sys_users()
+        show = [{
+            "user_id": r.get("user_id"),
+            "user_name": r.get("user_name"),
+            "nick_name": r.get("nick_name"),
+            "phonenumber": r.get("phonenumber"),
+        } for r in src][:200]
+        st.dataframe(show, use_container_width=True)
+
+    if btn_write_preview:
+        src = _select_sys_users()
+        rows_preview = [_build_usr_row(r) for r in src]
+        st.dataframe([
+            {"uuid": x["uuid"], "email": x["email"], "tel": x["tel"], "name": x["name"], "sid": x["sid"], "belong_space": x["belong_space"], "data": x["data"]}
+            for x in rows_preview
+        ][:200], use_container_width=True)
+
+    if btn_apply:
+        src = _select_sys_users()
+        targets = [_build_usr_row(r) for r in src]
+        total = len(targets)
+        prog = st.progress(0)
+        wrote = 0
+        batch = []
+        for i, row in enumerate(targets, 1):
+            batch.append(row)
+            if len(batch) >= 100:
+                wrote += _write_usr(batch)
+                batch = []
+            prog.progress(min(1.0, i/max(1,total)))
+        if batch:
+            wrote += _write_usr(batch)
+        st.success(f"入库 usr {wrote} 条")
+
+    if btn_del:
+        n = _delete_usr_by_sys_users()
+        st.success(f"已删除 usr {n} 条（来自 sys_user 的邮箱匹配）")
+
+    if btn_del_preview:
+        _preview_delete_usr_by_sys_users()
 
 
 # ================= 入口 =================

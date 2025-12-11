@@ -1020,6 +1020,40 @@ def upsert_entity(type_name: str, key_field: str, key_value: Any, name: str, dat
     finally:
         conn.close()
 
+def update_entity_data_by_uuid(uuid: str, patch: Dict[str, Any], name: Optional[str] = None) -> int:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT data,name FROM entity WHERE uuid=%s LIMIT 1", (uuid,))
+            row = cur.fetchone()
+            if not row:
+                return 0
+            old_data_json, old_name = row[0], row[1]
+            try:
+                old_data = json.loads(old_data_json or "{}")
+            except Exception:
+                old_data = {}
+            def _merge(a, b):
+                for k, v in b.items():
+                    if isinstance(v, dict) and isinstance(a.get(k), dict):
+                        _merge(a[k], v)
+                    else:
+                        a[k] = v
+                return a
+            new_data = _merge(old_data, patch or {})
+            now_ts = int(time.time())
+            cur.execute(
+                "UPDATE entity SET name=%s, data=%s, update_date=%s WHERE uuid=%s",
+                ((name if name is not None else old_name), json.dumps(new_data, ensure_ascii=False), now_ts, uuid)
+            )
+        conn.commit()
+        return 1
+    except Exception as e:
+        conn.rollback()
+        print("[update_entity_data_by_uuid error]", e)
+        return 0
+    finally:
+        conn.close()
 # =============== 对外：状态 / 入库 / 删除 ===============
 def check_entity_status(type_name: str, sid: Optional[str] = None) -> int:
     """返回该 type 在 entity 的记录数；若传入 sid 则按 sid 过滤"""
