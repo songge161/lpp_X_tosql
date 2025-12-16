@@ -73,6 +73,27 @@ def update_runtime_db(kind: str, cfg: Dict[str, Any]):
     _RUNTIME_CFG = {kk: cfg.get(kk) for kk in keys if kk in cfg}
     _RUNTIME_SCHEMA = _RUNTIME_CFG.get("schema")
 
+_SOURCE_DB_KIND: str = "pg"
+_SOURCE_CFG: Dict[str, Any] = {
+    "host": "127.0.0.1",
+    "port": 5432,
+    "user": "postgres",
+    "password": "",
+    "database": "postgres",
+    "schema": "public",
+}
+_SOURCE_SCHEMA: Optional[str] = None
+
+def update_source_db(kind: str, cfg: Dict[str, Any]):
+    global _SOURCE_DB_KIND, _SOURCE_CFG, _SOURCE_SCHEMA
+    k = (kind or "").strip().lower()
+    if k not in ("mysql", "pg"):
+        k = "pg"
+    _SOURCE_DB_KIND = k
+    keys = ["host", "port", "user", "password", "database", "charset", "autocommit", "schema"]
+    _SOURCE_CFG = {kk: cfg.get(kk) for kk in keys if kk in cfg}
+    _SOURCE_SCHEMA = _SOURCE_CFG.get("schema")
+
 def current_cfg() -> Dict[str, Any]:
     return dict(_RUNTIME_CFG)
 
@@ -84,6 +105,18 @@ _SCHEMA_SAFE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def _apply_pg_search_path(conn):
     """如果设置了 schema，则在 PG 连接上应用 search_path。"""
     schema = _RUNTIME_SCHEMA
+    if not schema:
+        return
+    if not _SCHEMA_SAFE_RE.match(schema):
+        raise ValueError(f"Invalid schema name: {schema}")
+    cur = conn.cursor()
+    try:
+        cur.execute(f"SET search_path TO {schema}")
+    finally:
+        cur.close()
+
+def _apply_source_pg_search_path(conn):
+    schema = _SOURCE_SCHEMA
     if not schema:
         return
     if not _SCHEMA_SAFE_RE.match(schema):
@@ -117,6 +150,30 @@ def get_conn():
             database=_RUNTIME_CFG.get("database"),
             charset=_RUNTIME_CFG.get("charset", "utf8mb4"),
             autocommit=_RUNTIME_CFG.get("autocommit", False),
+        )
+
+def get_source_conn():
+    if _SOURCE_DB_KIND == "pg":
+        import psycopg2
+        conn = psycopg2.connect(
+            host=_SOURCE_CFG.get("host"),
+            port=_SOURCE_CFG.get("port"),
+            user=_SOURCE_CFG.get("user"),
+            password=_SOURCE_CFG.get("password"),
+            dbname=_SOURCE_CFG.get("database"),
+        )
+        _apply_source_pg_search_path(conn)
+        return conn
+    else:
+        import pymysql
+        return pymysql.connect(
+            host=_SOURCE_CFG.get("host"),
+            port=_SOURCE_CFG.get("port"),
+            user=_SOURCE_CFG.get("user"),
+            password=_SOURCE_CFG.get("password"),
+            database=_SOURCE_CFG.get("database"),
+            charset=_SOURCE_CFG.get("charset", "utf8mb4"),
+            autocommit=_SOURCE_CFG.get("autocommit", False),
         )
 
 def json_equals_clause(json_col: str, key: str) -> str:

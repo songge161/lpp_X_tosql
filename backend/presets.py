@@ -69,6 +69,48 @@ def init_presets_db():
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS src_db_presets (
+                name TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                host TEXT,
+                port INTEGER,
+                user TEXT,
+                password TEXT,
+                database TEXT NOT NULL,
+                schema TEXT
+            )
+            """
+        )
+        try:
+            cur = conn.execute("PRAGMA table_info(src_db_presets)")
+            cols = [r[1] for r in cur.fetchall()]
+            def _add(col_name: str, col_def: str):
+                if col_name not in cols:
+                    conn.execute(f"ALTER TABLE src_db_presets ADD COLUMN {col_def}")
+            _add("host", "host TEXT")
+            _add("port", "port INTEGER")
+            _add("user", "user TEXT")
+            _add("password", "password TEXT")
+            _add("schema", "schema TEXT")
+        except Exception:
+            pass
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS src_app_state (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                kind TEXT,
+                host TEXT,
+                port INTEGER,
+                user TEXT,
+                password TEXT,
+                database TEXT,
+                schema TEXT
+            )
+            """
+        )
+
 
 def list_presets() -> List[Dict]:
     """列出所有已保存的库+空间预设（含完整连接信息与 sid）。"""
@@ -189,5 +231,72 @@ def save_last_runtime(kind: str, cfg: Dict, sid: str) -> None:
                 1 if cfg.get("autocommit") else 0,
                 cfg.get("schema"),
                 sid,
+            )
+        )
+
+def list_src_presets() -> List[Dict]:
+    with _conn() as conn:
+        cur = conn.execute(
+            """
+            SELECT name, kind, host, port, user, password, database, schema
+            FROM src_db_presets ORDER BY name
+            """
+        )
+        rows = [dict(row) for row in cur.fetchall()]
+        return rows
+
+def save_src_preset(name: str, kind: str, host: str, port: int, user: str, password: str, database: str, schema: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO src_db_presets(name, kind, host, port, user, password, database, schema)
+            VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(name) DO UPDATE SET
+                kind=excluded.kind,
+                host=excluded.host,
+                port=excluded.port,
+                user=excluded.user,
+                password=excluded.password,
+                database=excluded.database,
+                schema=excluded.schema
+            """,
+            (name, kind, host, int(port or 0), user, password, database, schema)
+        )
+
+def delete_src_preset(name: str) -> None:
+    with _conn() as conn:
+        conn.execute("DELETE FROM src_db_presets WHERE name=?", (name,))
+
+def get_last_source() -> Optional[Dict]:
+    with _conn() as conn:
+        cur = conn.execute("SELECT * FROM src_app_state WHERE id=1")
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+def save_last_source(kind: str, cfg: Dict) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO src_app_state(id, kind, host, port, user, password, database, schema)
+            VALUES(1, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                kind=excluded.kind,
+                host=excluded.host,
+                port=excluded.port,
+                user=excluded.user,
+                password=excluded.password,
+                database=excluded.database,
+                schema=excluded.schema
+            """,
+            (
+                kind,
+                cfg.get("host"),
+                int(cfg.get("port") or 0) if cfg.get("port") is not None else None,
+                cfg.get("user"),
+                cfg.get("password"),
+                cfg.get("database"),
+                cfg.get("schema"),
             )
         )

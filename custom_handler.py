@@ -53,10 +53,10 @@ def fetch_field(table: str, key_field: str, key_value: Any, target_field: str) -
             sql = f"""
                 SELECT JSON_UNQUOTE(JSON_EXTRACT(data, '$.{target_field}'))
                 FROM entity
-                WHERE type=%s AND JSON_EXTRACT(data, CONCAT('$.', %s))=%s
+                WHERE type=%s AND JSON_UNQUOTE(JSON_EXTRACT(data, CONCAT('$.', %s)))=%s
                 LIMIT 1
             """
-            cur.execute(sql, (table, key_field, key_value))
+            cur.execute(sql, (table, key_field, str(key_value)))
             row = cur.fetchone()
             if row and row[0]:
                 _CACHE[cache_k] = row[0]
@@ -87,10 +87,10 @@ def fetch_field_uuid(table: str, key_field: str, key_value: Any) -> Optional[str
             sql = """
                 SELECT uuid
                 FROM entity
-                WHERE type=%s AND JSON_EXTRACT(data, CONCAT('$.', %s))=%s
+                WHERE type=%s AND JSON_UNQUOTE(JSON_EXTRACT(data, CONCAT('$.', %s)))=%s
                 LIMIT 1
             """
-            cur.execute(sql, (table, key_field, key_value))
+            cur.execute(sql, (table, key_field, str(key_value)))
             row = cur.fetchone()
             if row and row[0]:
                 _CACHE[cache_k] = row[0]

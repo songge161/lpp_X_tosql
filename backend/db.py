@@ -1,6 +1,7 @@
 # backend/db.py
 # -*- coding: utf-8 -*-
 import sqlite3
+import json
 from pathlib import Path
 from typing import List, Dict, Any
 import time
@@ -88,6 +89,28 @@ def init_db():
         );
         """
     )
+    # --- 访问缓存表 ---
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS access_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_kind TEXT,
+            conn_key TEXT,
+            table_name TEXT,
+            updated_at INTEGER,
+            payload TEXT,
+            UNIQUE(source_kind, conn_key, table_name)
+        );
+        """
+    )
+    try:
+        cur.execute("PRAGMA table_info(access_cache)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "conn_key" not in cols:
+            cur.execute("ALTER TABLE access_cache ADD COLUMN conn_key TEXT")
+            conn.commit()
+    except Exception:
+        pass
     try:
         cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='file_map_cfgs'")
         row = cur.fetchone()
@@ -261,6 +284,54 @@ def upsert_file_map_cfg(cfg: Dict[str, Any]) -> int:
     row = cur.fetchone()
     conn.close()
     return int(row[0]) if row else 0
+
+
+# ========== 访问缓存 API ==========
+def get_access_cache(source_kind: str, conn_key: str, table_name: str) -> List[Dict[str, Any]]:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT payload FROM access_cache WHERE source_kind=? AND conn_key=? AND table_name=?",
+        (source_kind or "", conn_key or "", table_name or "")
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return []
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return []
+
+def set_access_cache(source_kind: str, conn_key: str, table_name: str, rows: List[Dict[str, Any]]) -> None:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO access_cache(source_kind, conn_key, table_name, updated_at, payload)
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(source_kind, conn_key, table_name) DO UPDATE SET
+          updated_at=excluded.updated_at,
+          payload=excluded.payload
+        """,
+        (source_kind or "", conn_key or "", table_name or "", int(time.time()), json.dumps(rows, ensure_ascii=False))
+    )
+    conn.commit()
+    conn.close()
+
+def clear_access_cache(source_kind: str = None, conn_key: str = None) -> int:
+    conn = _conn()
+    cur = conn.cursor()
+    if source_kind and conn_key:
+        cur.execute("DELETE FROM access_cache WHERE source_kind=? AND conn_key=?", (source_kind, conn_key))
+    elif source_kind:
+        cur.execute("DELETE FROM access_cache WHERE source_kind=?", (source_kind,))
+    else:
+        cur.execute("DELETE FROM access_cache")
+    conn.commit()
+    n = cur.rowcount or 0
+    conn.close()
+    return n
 
 
 def list_file_map_cfgs() -> List[Dict[str, Any]]:
