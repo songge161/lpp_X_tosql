@@ -768,6 +768,93 @@ def _parse_sql_file(sql_path: Path) -> List[Dict[str, Any]]:
         entities.append(dict(zip(cols, vals)))
     return entities
 
+def query_source_sql(sql: str, main_table: str = "") -> List[Dict[str, Any]]:
+    """
+    在内存 SQLite 中执行针对源文件的 SQL 查询。
+    支持跨表 JOIN (自动检测 SQL 中的表名并加载 source/sql/*.sql)。
+    """
+    import sqlite3
+    import re
+    
+    # 1. 识别涉及的表
+    tables = set()
+    if main_table:
+        tables.add(main_table)
+        
+    # 简单正则提取 FROM/JOIN 后的表名
+    # 排除 SQL 关键字，但这只是粗略提取，多加载几个表无妨
+    pattern = re.compile(r'\b(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)', re.IGNORECASE)
+    for t in pattern.findall(sql):
+        if t.lower() not in ("select", "where", "group", "order", "limit", "left", "right", "inner", "outer", "on", "as"):
+            tables.add(t)
+            
+    conn = sqlite3.connect(":memory:")
+    cur = conn.cursor()
+    
+    try:
+        # 2. 加载数据到 SQLite
+        for tbl in tables:
+            p = detect_sql_path(tbl)
+            if not p.exists():
+                continue
+            
+            # 优先用缓存
+            rows = _SQL_ROWS_CACHE.get(tbl)
+            if rows is None:
+                rows = _parse_sql_file(p)
+                _SQL_ROWS_CACHE[tbl] = rows
+            
+            if not rows:
+                # 空表创建 dummy
+                cur.execute(f"CREATE TABLE {tbl} (id TEXT)")
+                continue
+                
+            # 推断列名（取并集）
+            keys = set()
+            for r in rows:
+                keys.update(r.keys())
+            cols = list(keys)
+            
+            # 简单清洗列名，防止注入或非法字符
+            safe_cols = [c for c in cols if re.match(r'^\w+$', c)]
+            if not safe_cols:
+                continue
+                
+            # 建表：全用 TEXT 简化处理
+            col_defs = ", ".join([f"{c} TEXT" for c in safe_cols])
+            cur.execute(f"CREATE TABLE {tbl} ({col_defs})")
+            
+            # 插入数据
+            placeholders = ", ".join(["?"] * len(safe_cols))
+            insert_sql = f"INSERT INTO {tbl} ({', '.join(safe_cols)}) VALUES ({placeholders})"
+            
+            batch = []
+            for r in rows:
+                # 转 str 存入
+                batch.append([str(r.get(c, "")) for c in safe_cols])
+            
+            if batch:
+                cur.executemany(insert_sql, batch)
+                
+        conn.commit()
+        
+        # 3. 执行查询
+        cur.execute(sql)
+        desc = cur.description
+        if not desc:
+            return []
+            
+        col_names = [d[0] for d in desc]
+        res = []
+        for row in cur.fetchall():
+            res.append(dict(zip(col_names, row)))
+            
+        return res
+    except Exception as e:
+        return [{"error": str(e)}]
+    finally:
+        conn.close()
+
 def _ensure_entity_table(conn):
     with conn.cursor() as cur:
         if is_pg():
@@ -878,15 +965,16 @@ def _del_by_path(obj: Dict[str, Any], path: str):
 
 
 # ========== NEW: 抽取顶层 meta（并从 data JSON 中剔除这些 meta）==========
-def _extract_entity_meta(mapped: Dict[str, Any], now_ts: int) -> Dict[str, int]:
+def _extract_entity_meta(mapped: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, int]:
     """
     将 del / input_date / update_date 作为 entity 顶层列使用；
     若不存在，使用默认值；从 mapped 中移除这些键，避免进入 data JSON。
     """
+    ts = now_ts if now_ts is not None else int(time.time())
     meta = {
         "del": int(mapped.pop("del", 0) or 0),
-        "input_date": int(mapped.pop("input_date", now_ts) or now_ts),
-        "update_date": int(mapped.pop("update_date", now_ts) or now_ts),
+        "input_date": int(mapped.pop("input_date", ts) or ts),
+        "update_date": int(mapped.pop("update_date", ts) or ts),
     }
     return meta
 
@@ -894,7 +982,8 @@ def _extract_entity_meta(mapped: Dict[str, Any], now_ts: int) -> Dict[str, int]:
 # ========== NEW: 单条 UPSERT 到 entity ==========
 def _upsert_entity_row(type_name: str, key_field: str, key_value: Any,
                        sid: str, name_val: str, data_json: str,
-                       meta: Dict[str, int], import_mode: str = "upsert") -> int:
+                       meta: Dict[str, int], import_mode: str = "upsert",
+                       conn = None) -> int:
     """
     使用 (type_name, JSON_EXTRACT(data, $.<key_field>)=key_value) 实现 UPSERT。
     命中则 UPDATE：name、data、update_date；未命中则 INSERT。
@@ -902,9 +991,14 @@ def _upsert_entity_row(type_name: str, key_field: str, key_value: Any,
     """
     if key_value in (None, ""):
         # 没有唯一键值，不写
+        print(f"[_upsert_entity_row] Skipped due to empty key_value. type={type_name}, key_field={key_field}")
         return 0
 
-    conn = get_conn()
+    should_close = False
+    if conn is None:
+        conn = get_conn()
+        should_close = True
+
     try:
         with conn.cursor() as cur:
             # 查询是否已存在该唯一键
@@ -980,7 +1074,11 @@ def _upsert_entity_row(type_name: str, key_field: str, key_value: Any,
         print("[_upsert_entity_row error]", e)
         return 0
     finally:
-        conn.close()
+        if should_close:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def upsert_entity(type_name: str, key_field: str, key_value: Any, name: str, data_json: str):
     conn = get_conn()
@@ -1081,14 +1179,30 @@ def import_table_data(source_table: str, sid: str = None, target_entity_spec: Op
     - del/input_date/update_date 抽到 entity 顶层（不进 data JSON）。
     """
     sid = sid or SID
-    sql_path = detect_sql_path(source_table)
-    if not sql_path.exists():
-        print(f"[import_table_data] SQL not found: {sql_path}")
-        return 0
+    
+    # ✅ 尝试加载自定义筛选 SQL
+    from backend.db import get_table_filter_sql
+    # 确定目标实体 key：优先使用传入的 spec，否则查默认
+    eff_target = target_entity_spec or get_target_entity(source_table)
+    filter_sql = get_table_filter_sql(source_table, eff_target)
+    
+    records = []
+    if filter_sql and filter_sql.strip():
+        # print(f"[import_table_data] Using custom filter SQL for {source_table}")
+        res = query_source_sql(filter_sql, source_table)
+        if res and isinstance(res, list) and len(res) > 0 and "error" in res[0]:
+             print(f"[import_table_data] Filter SQL error: {res[0]['error']}")
+             return 0
+        records = res
+    else:
+        sql_path = detect_sql_path(source_table)
+        if not sql_path.exists():
+            print(f"[import_table_data] SQL not found: {sql_path}")
+            return 0
+        records = _parse_sql_file(sql_path)
 
-    records = _parse_sql_file(sql_path)
     if not records:
-        print(f"[import_table_data] No INSERT values in {sql_path.name}")
+        print(f"[import_table_data] No records (SQL/Filter) for {source_table}")
         return 0
 
     # ⭐ 支持外部指定目标类型与排除（如 'fund'、'fund(id)'、'fund(usci)[data.id,name]'）
@@ -1102,68 +1216,81 @@ def import_table_data(source_table: str, sid: str = None, target_entity_spec: Op
     stride = 1 if total <= 100 else max(1, total // 100)
     last_cb_ts = 0.0
 
-    for idx, rec in enumerate(records, start=1):
-        # 1) 映射：按当前 final_type 过滤字段映射 & 脚本上下文
-        mapped_data, out_name, type_override = apply_record_mapping(
-            source_table, rec, py_script="", target_entity=final_type
-        )
-        type_here = (type_override or final_type).strip() or source_table
+    # 使用单个连接进行批量处理，避免频繁握手导致 OperationalError
+    conn = get_conn()
+    try:
+        for idx, rec in enumerate(records, start=1):
+            # 1) 映射：按当前 final_type 过滤字段映射 & 脚本上下文
+            mapped_data, out_name, type_override = apply_record_mapping(
+                source_table, rec, py_script="", target_entity=final_type
+            )
+            type_here = (type_override or final_type).strip() or source_table
 
-        # 2) 统一键值：优先 mapped_data，其次原始 rec
-        key_val = mapped_data.get(key_field, None)
-        if key_val in (None, ""):
-            key_val = rec.get(key_field, "")
+            # 2) 统一键值：优先 mapped_data，其次原始 rec
+            key_val = mapped_data.get(key_field, None)
+            if key_val in (None, ""):
+                key_val = rec.get(key_field, "")
+            
+            # 调试：如果最终 key_val 仍为空，打印警告
+            if key_val in (None, ""):
+                print(f"[import_table_data] Warning: key_field '{key_field}' is empty for record. Source: {source_table}. Record: {rec}")
 
-        # 3) 应用排除：删除指定的 data.* 字段；'name' 排除则不写顶层 name
-        name_excluded = False
-        for ex in excludes:
-            if ex == "name":
-                name_excluded = True
-            elif ex.startswith("data."):
-                p = ex[5:].strip()
-                if p and p != key_field:
-                    _del_by_path(mapped_data, p)
+            # 3) 应用排除：删除指定的 data.* 字段；'name' 排除则不写顶层 name
+            name_excluded = False
+            for ex in excludes:
+                if ex == "name":
+                    name_excluded = True
+                elif ex.startswith("data."):
+                    p = ex[5:].strip()
+                    if p and p != key_field:
+                        _del_by_path(mapped_data, p)
 
-        # 4) 确保该统一键被写入 data JSON
-        if key_field not in mapped_data:
-            mapped_data[key_field] = key_val
+            # 4) 确保该统一键被写入 data JSON
+            if key_field not in mapped_data:
+                mapped_data[key_field] = key_val
 
-        # 5) 元字段抽取（并从 data JSON 剔除）
-        meta = _extract_entity_meta(mapped_data, now_ts=now_ts)
+            # 5) 元字段抽取（并从 data JSON 剔除）
+            meta = _extract_entity_meta(mapped_data, now_ts=now_ts)
 
-        # 6) name 取 mapped_data['__name__'] 回落 out_name；若排除 name 则置空
-        name_val = (mapped_data.get("__name__") or out_name or "").strip()
-        if name_excluded:
-            name_val = ""
-            if "__name__" in mapped_data:
-                try:
-                    del mapped_data["__name__"]
-                except Exception:
-                    pass
+            # 6) name 取 mapped_data['__name__'] 回落 out_name；若排除 name 则置空
+            name_val = (mapped_data.get("__name__") or out_name or "").strip()
+            if name_excluded:
+                name_val = ""
+                if "__name__" in mapped_data:
+                    try:
+                        del mapped_data["__name__"]
+                    except Exception:
+                        pass
 
-        # 7) 序列化 data（此时已不包含 del/input_date/update_date）
-        data_json = json.dumps(mapped_data, ensure_ascii=False)
+            # 7) 序列化 data（此时已不包含 del/input_date/update_date）
+            data_json = json.dumps(mapped_data, ensure_ascii=False)
 
-        # 8) UPSERT
-        wrote += _upsert_entity_row(
-            type_name=type_here,
-            key_field=key_field,
-            key_value=key_val,
-            sid=sid,
-            name_val=name_val,
-            data_json=data_json,
-            meta=meta,
-            import_mode=import_mode
-        )
-        # 9) 进度回调（每处理一条记录）
+            # 8) UPSERT
+            wrote += _upsert_entity_row(
+                type_name=type_here,
+                key_field=key_field,
+                key_value=key_val,
+                sid=sid,
+                name_val=name_val,
+                data_json=data_json,
+                meta=meta,
+                import_mode=import_mode,
+                conn=conn
+            )
+            # 9) 进度回调（每处理一条记录）
+            try:
+                if progress_cb:
+                    now = time.time()
+                    if (idx == total) or (idx % stride == 0) or (now - last_cb_ts >= 0.05):
+                        progress_cb(idx, total)
+                        last_cb_ts = now
+            except Exception:
+                # 回调失败不影响主流程
+                pass
+    finally:
         try:
-            if progress_cb:
-                now = time.time()
-                if (idx == total) or (idx % stride == 0) or (now - last_cb_ts >= 0.05):
-                    progress_cb(idx, total)
-                    last_cb_ts = now
+            conn.close()
         except Exception:
-            # 回调失败不影响主流程
             pass
 
     return wrote
@@ -1197,36 +1324,4 @@ def get_all_prioritized_tables() -> List[str]:
 
 def get_table_priority(source_table: str) -> int:
     return get_priority(source_table)
-def _extract_entity_meta(mapped: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
-    """
-    从映射完的 new_rec 中抽出需要放到 entity 顶层的元字段：
-      - del               -> 顶层 del (int)
-      - input_date        -> 顶层 input_date (bigint 秒/毫秒都可，你这里用秒)
-      - update_date       -> 顶层 update_date (bigint)
-    抽出后会从 mapped 中移除这些键，以保证 data 里不再包含它们。
-    """
-    meta = {}
-    if "del" in mapped:
-        try:
-            meta["del"] = int(mapped.pop("del"))
-        except Exception:
-            meta["del"] = 0
-    if "input_date" in mapped:
-        try:
-            meta["input_date"] = int(mapped.pop("input_date"))
-        except Exception:
-            meta["input_date"] = int(now_ts or time.time())
-    if "update_date" in mapped:
-        try:
-            meta["update_date"] = int(mapped.pop("update_date"))
-        except Exception:
-            meta["update_date"] = int(now_ts or time.time())
 
-    # 默认兜底
-    if "del" not in meta:
-        meta["del"] = 0
-    if "input_date" not in meta:
-        meta["input_date"] = int(now_ts or time.time())
-    if "update_date" not in meta:
-        meta["update_date"] = int(now_ts or time.time())
-    return meta

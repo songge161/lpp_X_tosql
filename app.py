@@ -633,6 +633,19 @@ def _build_instance_json(proc_inst_id: str) -> Dict[str, Any]:
         "delete_reason_","proc_inst_id_","parent_task_id_"
     ])
     hist_acts  = _pick_cols(hi_act,  ["id_","act_id_","act_name_","assignee_","start_time_","end_time_","task_id_","proc_inst_id_"])
+    
+    # 历史变量完整列表（用于后续按 task_id 查找）
+    hist_vars_list = [
+        {
+            "name_": v.get("name_", ""),
+            "value": _var_value(v),
+            "task_id_": v.get("task_id_", ""),
+            "execution_id_": v.get("execution_id_", ""),
+            "create_time_": v.get("create_time_", ""),
+            "last_updated_time_": v.get("last_updated_time_", ""),
+        }
+        for v in hi_var
+    ]
 
     # 抄送记录精选字段
     copy_rows = _pick_cols(copies, ["id","user_id","start_user_id","task_id","task_name","category","process_instance_id","process_instance_name","create_time","update_time"]) 
@@ -668,6 +681,11 @@ def _build_instance_json(proc_inst_id: str) -> Dict[str, Any]:
             }
             for c in hi_cmts if str(c.get("task_id_", "")) == tid
         ]
+        rv_list = []
+        if tid:
+            rv_list.extend([v for v in ru_var if str(v.get("task_id_", "")) == tid])
+        rv_list.extend([v for v in ru_var if str(v.get("execution_id_", "")) == ex])
+
         var_run = [
             {
                 "name_": v.get("name_", ""),
@@ -675,8 +693,14 @@ def _build_instance_json(proc_inst_id: str) -> Dict[str, Any]:
                 "create_time_": v.get("create_time_", ""),
                 "last_updated_time_": v.get("last_updated_time_", ""),
             }
-            for v in ru_var if str(v.get("execution_id_", "")) == ex
+            for v in rv_list
         ]
+
+        hv_list = []
+        if tid:
+            hv_list.extend([v for v in hi_var if str(v.get("task_id_", "")) == tid])
+        hv_list.extend([v for v in hi_var if str(v.get("execution_id_", "")) == ex])
+
         var_hist = [
             {
                 "name_": v.get("name_", ""),
@@ -684,7 +708,7 @@ def _build_instance_json(proc_inst_id: str) -> Dict[str, Any]:
                 "create_time_": v.get("create_time_", ""),
                 "last_updated_time_": v.get("last_updated_time_", ""),
             }
-            for v in hi_var if str(v.get("execution_id_", "")) == ex
+            for v in hv_list
         ]
         pipeline.append({
             "activity": activity,
@@ -847,6 +871,7 @@ def _build_instance_json(proc_inst_id: str) -> Dict[str, Any]:
             "tasks": hist_tasks,
             "activities": hist_acts,
             "variables": hist_vars,
+            "all_variables": hist_vars_list,
             "comments_by_task": comments_by_task,
         },
         "copies": copy_rows,
@@ -1061,6 +1086,59 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
     rt_vars_map = _var_map(rt_vars_list)
     hi_vars_map = _var_map(hi_vars_list)
     biz_name = str(rt_vars_map.get("businessName") or hi_vars_map.get("businessName") or "")
+    def _fmt_duration_auto(v):
+        if v in (None, ""):
+            return ""
+        s = str(v).strip()
+        try:
+            x = float(s)
+        except Exception:
+            return s
+        secs = x / 1000.0 if x >= 1000 else x
+        secs = int(secs)
+        d = secs // 86400; secs %= 86400
+        h = secs // 3600; secs %= 3600
+        m = secs // 60; secs %= 60
+        parts = []
+        if d: parts.append(f"{d} 天")
+        if h: parts.append(f"{h} 小时")
+        if m: parts.append(f"{m} 分钟")
+        if secs and not parts:
+            parts.append(f"{secs} 秒")
+        return " ".join(parts) or "0 秒"
+    def _fmt_time(v):
+        if v in (None, ""):
+            return ""
+        s = str(v).strip()
+        try:
+            x = float(s)
+            ms = int(x) if x >= 1e11 else int(x * 1000)
+            from datetime import datetime
+            dt = datetime.fromtimestamp(ms / 1000.0)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            try:
+                from datetime import datetime
+                t = s.replace("T", " ").replace("Z", "")
+                dt = datetime.fromisoformat(t)
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return s
+    def _ts_num(v):
+        s = str(v or "").strip()
+        if not s:
+            return 0
+        try:
+            x = float(s)
+            ms = int(x) if x >= 1e11 else int(x * 1000)
+            return ms
+        except Exception:
+            try:
+                from datetime import datetime
+                t = s.replace("T", " ").replace("Z", "")
+                return int(datetime.fromisoformat(t).timestamp() * 1000)
+            except Exception:
+                return 0
     segs = data.get("segments", []) or []
     nodes = []
     for idx in range(len(segs)):
@@ -1170,79 +1248,22 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
     src = json.dumps(preview_obj, ensure_ascii=False)
     esc = src.replace("'", "''")
     fields_obj = fields_obj or {}
-    fields_obj["source_flow"] = esc
-    try:
-        raw = fields_obj.get("source_flow", "")
-        parsed = json.loads(raw.replace("''", "'")) if raw else {}
-    except Exception:
-        parsed = preview_obj
+    # fields_obj["source_flow"] = esc
+    parsed = preview_obj
     meta_info = parsed.get("meta", {}) or {}
     try:
-        start_raw = (
-            meta_info.get("startTime", "")
-            or data.get("startTime", "")
-            or ((parsed.get("nodes") or [{}])[0].get("start", "") if (parsed.get("nodes") or []) else "")
-        )
-        stxt = _fmt_time(start_raw)
-        fields_obj["sqsj"] = (stxt.split(" ")[0] if stxt else "")
+        stxt = _fmt_time(meta_info.get("startTime", ""))
+        fields_obj["sqsj"] = stxt
     except Exception:
         fields_obj["sqsj"] = ""
+    try:
+        etxt = _fmt_time(meta_info.get("endTime", ""))
+        fields_obj["jssj"] = etxt
+    except Exception:
+        fields_obj["jssj"] = ""
     fields_obj["lcbh"] = str(pid or "")
     hist = (parsed.get("variables", {}) or {}).get("history", {}) or {}
     nodes_md = []
-    def _fmt_duration_auto(v):
-        if v in (None, ""):
-            return ""
-        s = str(v).strip()
-        try:
-            x = float(s)
-        except Exception:
-            return s
-        secs = x / 1000.0 if x >= 1000 else x
-        secs = int(secs)
-        d = secs // 86400; secs %= 86400
-        h = secs // 3600; secs %= 3600
-        m = secs // 60; secs %= 60
-        parts = []
-        if d: parts.append(f"{d} 天")
-        if h: parts.append(f"{h} 小时")
-        if m: parts.append(f"{m} 分钟")
-        if secs and not parts:
-            parts.append(f"{secs} 秒")
-        return " ".join(parts) or "0 秒"
-    def _fmt_time(v):
-        if v in (None, ""):
-            return ""
-        s = str(v).strip()
-        try:
-            x = float(s)
-            ms = int(x) if x >= 1e11 else int(x * 1000)
-            from datetime import datetime
-            dt = datetime.fromtimestamp(ms / 1000.0)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            try:
-                from datetime import datetime
-                t = s.replace("T", " ").replace("Z", "")
-                dt = datetime.fromisoformat(t)
-                return dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                return s
-    def _ts_num(v):
-        s = str(v or "").strip()
-        if not s:
-            return 0
-        try:
-            x = float(s)
-            ms = int(x) if x >= 1e11 else int(x * 1000)
-            return ms
-        except Exception:
-            try:
-                from datetime import datetime
-                t = s.replace("T", " ").replace("Z", "")
-                return int(datetime.fromisoformat(t).timestamp() * 1000)
-            except Exception:
-                return 0
     nds_sorted = []
     nodes_src = (parsed.get("nodes", []) or [])
     for nd in nodes_src:
@@ -1257,6 +1278,7 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
     nds_sorted.sort(key=lambda n: _ts_num((n.get("task") or {}).get("start_time_") or n.get("start", "") or (n.get("task") or {}).get("end_time_") or n.get("end", "")), reverse=True)
     # 追加未出现在节点中的纯任务（如仅在 act_hi_taskinst 存在的子任务）
     hist_tasks_list = (data.get("history", {}) or {}).get("tasks", []) or []
+    all_vars_list = (data.get("history", {}) or {}).get("all_variables", [])
     present_ids = {str(((nd.get("task") or {}).get("id_")) or "").strip() for nd in nds_sorted}
     extra_nodes = []
     cm_map = ((data.get("history", {}) or {}).get("comments_by_task", {}) or {})
@@ -1264,6 +1286,15 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
         tid = str(ht.get("id_") or "").strip()
         if not tid or tid in present_ids:
             continue
+
+        task_vars = {}
+        if tid:
+            matched_vars = [v for v in all_vars_list if str(v.get("task_id_") or "") == tid]
+            for v in matched_vars:
+                nm = str(v.get("name_") or "")
+                if nm:
+                    task_vars[nm] = v.get("value")
+
         extra_nodes.append({
             "id": ht.get("task_id_", ""),
             "type": "userTask",
@@ -1286,7 +1317,7 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
                 "category_": ht.get("category_", ""),
                 "delete_reason_": ht.get("delete_reason_", ""),
             },
-            "value": {},
+            "value": task_vars,
             "actor_ids": [str(ht.get("assignee_", ""))],
             "next": {},
         })
@@ -1342,7 +1373,16 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
         end_txt = _fmt_time(t.get('end_time_') or nd.get('end',''))
         dur_text = _fmt_duration_auto(t.get('duration_')) or _fmt_duration_auto(nd.get('duration'))
         msg = (lc.get('message') or '').strip()
-        inline_extra, suggest_text = _split_msg(msg)
+        inline_extra, msg_suggest = _split_msg(msg)
+
+        # 优先使用 TASK_REASON，如果没有则回退到 message 解析
+        tr = ""
+        v_tmp = nd.get("value") or {}
+        if isinstance(v_tmp, dict):
+            tr = str(v_tmp.get("TASK_REASON") or "").strip()
+        
+        suggest_text = tr if tr else msg_suggest
+
         if (not any([assignee, start_txt, end_txt, (dur_text or ''), msg])) and (task_name in ('结束','')):
             return []
         status_text = ("审批通过" if mk=='🟢' else ("审批未通过" if mk=='🔴' else ""))
@@ -1393,24 +1433,31 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
             if ctid and ctid not in visited:
                 nodes_md.extend(_fmt_block(ch, label_child=True))
                 visited.add(ctid)
-    hs_raw = str(hist.get('taskStatus','')).strip()
-    code_map = {
-        '0':'待审批','1':'审批中','2':'审批通过','3':'审批不通过','4':'已取消','5':'已回退','6':'委派中','7':'审批通过中','8':'自动抄送'
-    }
-    concl = code_map.get(hs_raw)
-    if not concl:
-        hs = hs_raw.lower()
-        hmk = ''
-        for kw in ['通过','同意','批准','审核通过']:
-            if kw in hs:
-                hmk = '审核通过'
-                break
-        if not hmk:
-            for kw in ['驳回','拒绝','不通过','不同意']:
+    # 最终状态优先来源：流程变量 name_='PROCESS_STATUS'
+    ps_raw = str(hi_vars_map.get("PROCESS_STATUS") or hi_vars_map.get("processStatus") or "").strip()
+    status_map = {'0':'待提交','1':'审批中','2':'审批通过','3':'审批不通过','4':'已取消','5':'已回退'}
+    if ps_raw in status_map:
+        concl = status_map[ps_raw]
+    else:
+        # 兜底：若流程状态缺失，尝试从历史 taskStatus 文本推断
+        hs_raw = str(hist.get('taskStatus','')).strip()
+        code_map = {
+            '0':'待审批','1':'审批中','2':'审批通过','3':'审批不通过','4':'已取消','5':'已回退','6':'委派中','7':'审批通过中','8':'自动抄送'
+        }
+        concl = code_map.get(hs_raw)
+        if not concl:
+            hs = hs_raw.lower()
+            hmk = ''
+            for kw in ['通过','同意','批准','审核通过']:
                 if kw in hs:
-                    hmk = '审核未通过'
+                    hmk = '审核通过'
                     break
-        concl = '审批通过' if hmk=='审核通过' else ('审批未通过' if hmk=='审核未通过' else hs_raw)
+            if not hmk:
+                for kw in ['驳回','拒绝','不通过','不同意']:
+                    if kw in hs:
+                        hmk = '审核未通过'
+                        break
+            concl = '审批通过' if hmk=='审核通过' else ('审批未通过' if hmk=='审核未通过' else hs_raw)
     ended_raw = meta_info.get('endTime','')
     ended_flag = bool(str(ended_raw).strip())
     head_icon = '🟢' if concl in ('审批通过','审批通过中') else ('🔴' if concl in ('审批未通过','审批不通过') else '⚪')
@@ -1425,6 +1472,7 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
     start_md = f"**发起流程：【{starter}】在 {_fmt_time(meta_info.get('startTime',''))} 发起【 {flow_name} 】流程**"
     flow_md = "\n".join(([header1, header2, ""] if ended_flag else []) + nodes_md + ["", start_md]).strip()
     fields_obj["flow_md"] = flow_md
+    fields_obj["flow_md_label"] = flow_md
     # 统一补全：确保 data 中包含 name/type/id
     if (fields_obj.get("__name__") in (None, "")):
         fields_obj["__name__"] = biz_name
@@ -1437,11 +1485,17 @@ def _build_flow_import_bundle(pid: str, match: Dict[str, Any] = None) -> Dict[st
     key_field = "id"
     key_val = fields_obj.get("id") or (used_match or {}).get("id") or str(pid or "")
     fields_obj["id"] = key_val
+    
+    # 强制回写状态到 fields_obj，供批量入库提取
+    fields_obj["lcspzt"] = concl
+    fields_obj["lcspzt_label"] = concl
+
     meta = _extract_entity_meta(fields_obj)
     final_name = biz_name
     return {
         "fields_obj": fields_obj,
         "flow_md": flow_md,
+        "concl": concl,
         "meta": meta,
         "type_name": type_name,
         "key_field": key_field,
@@ -1519,13 +1573,29 @@ def render_table_detail(table_name: str):
 
     # 表级配置（当前管理目标 + 该目标的优先级）
     st.markdown("<div id=\"sec-config\"></div>", unsafe_allow_html=True)
-    col1, col2 = st.columns([3, 1])
+    col1, col2, col3 = st.columns([3, 1, 3])
     with col1:
         # 用当前 entity 作为默认，允许调整（保存时按当前 entity upsert）
         target_entity = st.text_input("当前管理目标 entity", value=current_entity)
     with col2:
         # 针对当前目标读取优先级
         priority = st.number_input("优先级", value=get_priority(table_name, target_entity), step=1)
+    with col3:
+        cur_desc = ""
+        try:
+            rows = list_tables(include_disabled=True)
+            for r in rows:
+                if isinstance(r, tuple):
+                    if r[0] == table_name and (r[1] or "") == (target_entity or ""):
+                        cur_desc = r[4] or ""
+                        break
+                else:
+                    if (r.get("source_table") or "") == table_name and (r.get("target_entity") or "") == (target_entity or ""):
+                        cur_desc = r.get("description") or ""
+                        break
+        except Exception:
+            cur_desc = ""
+        desc_val = st.text_input("描述", value=cur_desc, key=f"desc_{table_name}_{target_entity}")
 
     if st.button("保存表配置", use_container_width=True):
         old_entity = (current_entity or "").strip()
@@ -1557,11 +1627,16 @@ def render_table_detail(table_name: str):
                 except Exception:
                     st.experimental_set_query_params(page="detail", table=table_name, entity=new_entity)
 
+                try:
+                    save_table_mapping(table_name, new_entity, priority, desc_val or "")
+                except Exception:
+                    pass
+
                 st.success(f"已重命名：{old_entity} → {new_entity}")
                 st.rerun()
         else:
             # 同名：仅保存优先级
-            save_table_mapping(table_name, new_entity, priority)
+            save_table_mapping(table_name, new_entity, priority, desc_val or "")
             st.success("表配置已保存")
 
     st.caption(f"当前管理目标：{target_entity or '(未指定，使用表默认)'}")
@@ -1703,6 +1778,22 @@ def render_table_detail(table_name: str):
     if samples_key not in st.session_state:
         st.session_state[samples_key] = _parse_all_inserts(table_name)
     full_list = st.session_state[samples_key]
+    
+    # ✅ 自动加载并执行已保存的 SQL 筛选 (防止刷新后丢失)
+    filter_key = f"filter_{table_name}"
+    if filter_key not in st.session_state:
+         from backend.db import get_table_filter_sql
+         saved_sql = get_table_filter_sql(table_name, target_entity or st.session_state.get("current_entity") or "")
+         if saved_sql and saved_sql.strip():
+             # print(f"[DEBUG] Auto-executing saved filter SQL for {table_name}")
+             from backend.mapper_core import query_source_sql
+             res = query_source_sql(saved_sql, table_name)
+             if res and isinstance(res, list) and len(res) > 0 and "error" in res[0]:
+                 st.warning(f"自动加载筛选失败: {res[0]['error']}")
+             else:
+                 st.session_state[filter_key] = res
+                 # 同步到高级 SQL 文本框的 session
+                 st.session_state[f"adv_sql_{table_name}"] = saved_sql
 
     # 查找筛选区域
     st.caption("查找指定记录：填写字段名与值，支持非唯一匹配")
@@ -1740,13 +1831,44 @@ def render_table_detail(table_name: str):
         st.session_state.pop(filter_key, None)
         st.session_state[idx_key] = 0
 
+    # ================= 高级 SQL 筛选 =================
+    with st.expander("高级 SQL 筛选 (Advanced SQL Filter)", expanded=False):
+        st.caption("支持完整 SQL 语法 (JOIN, GROUP BY, etc.)。数据源为 source/sql 下的 SQL 文件。")
+        
+        # Load saved SQL if session state not set
+        if f"adv_sql_{table_name}" not in st.session_state:
+             from backend.db import get_table_filter_sql
+             saved_sql = get_table_filter_sql(table_name, current_entity)
+             if saved_sql:
+                 st.session_state[f"adv_sql_{table_name}"] = saved_sql
+                 
+        adv_sql = st.text_area("SQL 语句", value=st.session_state.get(f"adv_sql_{table_name}", f"SELECT * FROM {table_name}"), height=100)
+        if st.button("执行并保存筛选", key=f"btn_adv_sql_{table_name}"):
+            st.session_state[f"adv_sql_{table_name}"] = adv_sql
+            
+            # Save to DB
+            from backend.db import save_table_filter_sql
+            save_table_filter_sql(table_name, adv_sql, current_entity)
+            
+            from backend.mapper_core import query_source_sql
+            res = query_source_sql(adv_sql, table_name)
+            if res and isinstance(res, list) and len(res) > 0 and "error" in res[0]:
+                st.error(f"查询错误: {res[0]['error']}")
+            else:
+                st.session_state[filter_key] = res
+                st.session_state[idx_key] = 0
+                st.success(f"筛选到 {len(res)} 条记录，配置已保存")
+
     idx_key = f"sample_idx_{table_name}"
     if idx_key not in st.session_state:
         st.session_state[idx_key] = 0
     sample_index = st.session_state[idx_key]
 
     # 当前列表：优先过滤结果
-    curr_list = st.session_state.get(filter_key) or full_list
+    if filter_key in st.session_state:
+        curr_list = st.session_state[filter_key]
+    else:
+        curr_list = full_list
     total_n = len(curr_list)
     st.caption(f"当前预览索引：{sample_index + 1}/{max(total_n, 1)}（总 {len(full_list)} 条）")
 
@@ -1765,6 +1887,7 @@ def render_table_detail(table_name: str):
     with st.expander("SQL 样例记录", expanded=False):
         st.code(json.dumps(sample, ensure_ascii=False, indent=2))
 
+    st.caption(f"基于当前预览记录（第 {sample_index + 1} 条）进行模拟入库结果")
     if st.button("生成模拟打印"):
         py_now = get_table_script(table_name, target_entity or st.session_state.get("current_entity") or "") or ""
         data_rec, out_name, type_override = apply_record_mapping(
@@ -1954,24 +2077,26 @@ def render_mapped_tables():
     st.markdown("---")
 
     # 表头
-    head = st.columns([3, 3, 3, 1, 1, 2])
+    head = st.columns([3, 3, 3, 3, 1, 1, 2])
     head[0].markdown("**名称**")
     head[1].markdown("**源表**")
     head[2].markdown("**目标 type**")
-    head[3].markdown("**状态**")
-    head[4].markdown("**优先度**")
-    head[5].markdown("**操作**")
+    head[3].markdown("**描述**")
+    head[4].markdown("**状态**")
+    head[5].markdown("**优先度**")
+    head[6].markdown("**操作**")
 
     # 每行
     for r in rows:
         src = r["source_table"]
         tgt = r["target_entity"]
         pri = r["priority"]
+        desc = r.get("description") or ""
         disp_name = _guess_table_display_name(src)
         count = check_entity_status(tgt, sid=st.session_state.get("current_sid", SID))
         status = "✅ 已入库" if count > 0 else "❌ 未入库"
 
-        cols = st.columns([3, 3, 3, 1, 1, 3])
+        cols = st.columns([3, 3, 3, 3, 1, 1, 3])
         cols[0].text(disp_name)
         # 跳转时携带 entity 参数，直达该目标的详情页（新标签页打开）
         cols[1].markdown(
@@ -1979,10 +2104,11 @@ def render_mapped_tables():
             unsafe_allow_html=True
         )
         cols[2].text(tgt)
-        cols[3].text("✅" if count > 0 else "❌")
-        cols[4].text(str(pri))
+        cols[3].text(desc)
+        cols[4].text("✅" if count > 0 else "❌")
+        cols[5].text(str(pri))
 
-        with cols[5]:
+        with cols[6]:
             # 行级入库方式选择 + 操作按钮
             mode_label_to_val = {
                 "创建更新": "upsert",
@@ -2545,12 +2671,8 @@ def render_flow_mgmt():
             esc = src.replace("'", "''")
             if fields_obj is None:
                 fields_obj = {}
-            fields_obj["source_flow"] = esc
-            try:
-                raw = fields_obj.get("source_flow", "")
-                parsed = json.loads(raw.replace("''", "'")) if raw else {}
-            except Exception:
-                parsed = preview_obj
+            # fields_obj["source_flow"] = esc
+            parsed = preview_obj
             meta_info = parsed.get("meta", {}) or {}
             hist = (parsed.get("variables", {}) or {}).get("history", {}) or {}
             nodes_md = []
@@ -2704,7 +2826,14 @@ def render_flow_mgmt():
                 end_txt = _fmt_time(t.get('end_time_') or nd.get('end',''))
                 dur_text = _fmt_duration_auto(t.get('duration_')) or _fmt_duration_auto(nd.get('duration'))
                 msg = (lc.get('message') or '').strip()
-                inline_extra, suggest_text = _split_msg(msg)
+                inline_extra, msg_suggest = _split_msg(msg)
+
+                v_tmp = nd.get("value") or {}
+                tr_suggest = ""
+                if isinstance(v_tmp, dict):
+                    tr_suggest = str(v_tmp.get("TASK_REASON") or "").strip()
+
+                suggest_text = tr_suggest if tr_suggest else msg_suggest
                 if (not any([assignee, start_txt, end_txt, (dur_text or ''), msg])) and (task_name in ('结束','')):
                     return []
                 status_text = ("审批通过" if mk=='🟢' else ("审批未通过" if mk=='🔴' else ""))
@@ -2773,24 +2902,29 @@ def render_flow_mgmt():
                         nodes_md.append("")
                     nodes_md.append("审批建议：")
                     nodes_md.append("")
-            hs_raw = str(hist.get('taskStatus','')).strip()
-            code_map = {
-                '0':'待审批','1':'审批中','2':'审批通过','3':'审批不通过','4':'已取消','5':'已回退','6':'委派中','7':'审批通过中','8':'自动抄送'
-            }
-            concl = code_map.get(hs_raw)
-            if not concl:
-                hs = hs_raw.lower()
-                hmk = ''
-                for kw in ['通过','同意','批准','审核通过']:
-                    if kw in hs:
-                        hmk = '审核通过'
-                        break
-                if not hmk:
-                    for kw in ['驳回','拒绝','不通过','不同意']:
+            ps_raw = str(hi_vars_map.get("PROCESS_STATUS") or hi_vars_map.get("processStatus") or "").strip()
+            status_map = {'0':'待提交','1':'审批中','2':'审批通过','3':'审批不通过','4':'已取消','5':'已回退'}
+            if ps_raw in status_map:
+                concl = status_map[ps_raw]
+            else:
+                hs_raw = str(hist.get('taskStatus','')).strip()
+                code_map = {
+                    '0':'待审批','1':'审批中','2':'审批通过','3':'审批不通过','4':'已取消','5':'已回退','6':'委派中','7':'审批通过中','8':'自动抄送'
+                }
+                concl = code_map.get(hs_raw)
+                if not concl:
+                    hs = hs_raw.lower()
+                    hmk = ''
+                    for kw in ['通过','同意','批准','审核通过']:
                         if kw in hs:
-                            hmk = '审核未通过'
+                            hmk = '审核通过'
                             break
-                concl = '审批通过' if hmk=='审核通过' else ('审批未通过' if hmk=='审核未通过' else hs_raw)
+                    if not hmk:
+                        for kw in ['驳回','拒绝','不通过','不同意']:
+                            if kw in hs:
+                                hmk = '审核未通过'
+                                break
+                    concl = '审批通过' if hmk=='审核通过' else ('审批未通过' if hmk=='审核未通过' else hs_raw)
             ended_raw = meta_info.get('endTime','')
             ended_flag = bool(str(ended_raw).strip())
             head_icon = '🟢' if concl in ('审批通过','审批通过中') else ('🔴' if concl in ('审批未通过','审批不通过') else '⚪')
@@ -2805,6 +2939,7 @@ def render_flow_mgmt():
             start_md = f"**发起流程：【{starter}】在 {_fmt_time(meta_info.get('startTime',''))} 发起【 {flow_name} 】流程**"
             flow_md = "\n".join(([header1, header2, ""] if ended_flag else []) + nodes_md + ["", start_md]).strip()
             fields_obj["flow_md"] = flow_md
+            fields_obj["flow_md_label"] = flow_md
             meta = _extract_entity_meta(fields_obj)
             entity_obj = {
                 "uuid": "(mock uuid)",
@@ -2846,10 +2981,14 @@ def render_flow_mgmt():
                     "name": fields_obj.get("name", ""),
                     "bt": fields_obj.get("bt", ""),
                     "type": fields_obj.get("type", type_name),
-                    "source_flow": fields_obj.get("source_flow",""),
+                    # "source_flow": fields_obj.get("source_flow",""),
                     "flow_md": flow_md,
+                    "flow_md_label": flow_md,
+                    "lcspzt": fields_obj.get("lcspzt", ""),
+                    "lcspzt_label": fields_obj.get("lcspzt_label", ""),
                     "lcbh": fields_obj.get("lcbh", ""),
-                    "sqsj": fields_obj.get("sqsj", "")
+                    "sqsj": fields_obj.get("sqsj", ""),
+                    "jssj": fields_obj.get("jssj", "")
                 }
                 data_json = json.dumps(cover_obj, ensure_ascii=False)
                 import_mode = "upsert_replace"
@@ -2868,6 +3007,22 @@ def render_flow_mgmt():
                 st.success(f"入库完成：写入 {wrote} 条")
             st.stop()
 
+        elif final_pid and st.button("仅修复状态字段（当前）", key=f"fix_status_{final_pid}"):
+            bundle = _build_flow_import_bundle(final_pid)
+            concl = bundle.get("concl") or ""
+            rev = {'待提交':'0','审批中':'1','审批通过':'2','审批不通过':'3','已取消':'4','已回退':'5'}
+            code = rev.get(concl, "")
+            type_name = bundle.get("type_name") or ""
+            key_field = bundle.get("key_field") or "id"
+            key_val = bundle.get("key_val") or str(final_pid or "")
+            sid = st.session_state.get("current_sid", SID)
+            patch_obj = {"lcspzt": concl, "lcspzt_label": concl}
+            now_ts = int(time.time())
+            meta_fix = {"del": 0, "input_date": now_ts, "update_date": now_ts}
+            wrote = _upsert_entity_row(type_name, key_field, key_val, sid, "", json.dumps(patch_obj, ensure_ascii=False), meta_fix, import_mode="update_merge")
+            st.success(f"已修复状态字段：写入 {wrote} 条")
+            st.stop()
+
         elif st.button("批量入库当前流程全部", key=f"import_all_{flow_sel}"):
             rows = _build_instance_rows()
             def _match_flow(r):
@@ -2877,8 +3032,19 @@ def render_flow_mgmt():
             pg = st.progress(0)
             total = len(pids_all)
             wrote_sum = 0
+            start_ts = time.time()
+            def _fmt_eta(s):
+                try:
+                    m, ss = divmod(int(s), 60)
+                    return f"{m}分{ss}秒" if m else f"{ss}秒"
+                except Exception:
+                    return "--"
             for i, pid0 in enumerate(pids_all or []):
-                pg.progress(int(((i) / (total or 1)) * 100))
+                done = i
+                pct = int(((done) / (total or 1)) * 100)
+                elapsed = max(time.time() - start_ts, 0.001)
+                eta = int((total - done) * (elapsed / max(done, 1)))
+                pg.progress(pct, text=f"批量入库：{done}/{total}，预计剩余 {_fmt_eta(eta)}")
                 if not pid0:
                     continue
                 bundle = _build_flow_import_bundle(pid0)
@@ -2900,10 +3066,14 @@ def render_flow_mgmt():
                         "name": fields_obj.get("name", ""),
                         "bt": fields_obj.get("bt", ""),
                         "type": fields_obj.get("type", type_name),
-                        "source_flow": fields_obj.get("source_flow",""),
+                        # "source_flow": fields_obj.get("source_flow",""),
                         "flow_md": flow_md,
+                        "flow_md_label": flow_md,
+                        "lcspzt": fields_obj.get("lcspzt", ""),
+                        "lcspzt_label": fields_obj.get("lcspzt_label", ""),
                         "lcbh": fields_obj.get("lcbh", ""),
-                        "sqsj": fields_obj.get("sqsj", "")
+                        "sqsj": fields_obj.get("sqsj", ""),
+                        "jssj": fields_obj.get("jssj", "")
                     }
                     data_json = json.dumps(cover_obj, ensure_ascii=False)
                     import_mode = "upsert_replace"
@@ -2917,9 +3087,84 @@ def render_flow_mgmt():
                 sid = st.session_state.get("current_sid", SID)
                 wrote = _upsert_entity_row(type_name, key_field, key_val, sid, final_name, data_json, meta, import_mode=import_mode)
                 wrote_sum += int(wrote or 0)
-            pg.progress(100)
+            pg.progress(100, text=f"批量入库：{total}/{total}，预计剩余 0秒")
             st.success(f"批量入库完成：写入 {wrote_sum} 条")
 
+        elif st.button("批量入库（按流程编号lcbh合并）", key=f"import_all_lcbh_{flow_sel}"):
+            rows = _build_instance_rows()
+            def _match_flow(r):
+                return str(r.get("flow_define_name","")) == str(flow_sel)
+            view = [r for r in rows if _match_flow(r)]
+            pids_all = [r.get("proc_inst_id") for r in view]
+            pg = st.progress(0)
+            total = len(pids_all)
+            wrote_sum = 0
+            start_ts = time.time()
+            def _fmt_eta(s):
+                try:
+                    m, ss = divmod(int(s), 60)
+                    return f"{m}分{ss}秒" if m else f"{ss}秒"
+                except Exception:
+                    return "--"
+            for i, pid0 in enumerate(pids_all or []):
+                done = i
+                pct = int(((done) / (total or 1)) * 100)
+                elapsed = max(time.time() - start_ts, 0.001)
+                eta = int((total - done) * (elapsed / max(done, 1)))
+                pg.progress(pct, text=f"批量入库（合并）：{done}/{total}，预计剩余 {_fmt_eta(eta)}")
+                if not pid0:
+                    continue
+                bundle = _build_flow_import_bundle(pid0)
+                fields_obj = bundle.get("fields_obj") or {}
+                meta = bundle.get("meta") or {}
+                type_name = bundle.get("type_name") or ""
+                final_name = bundle.get("final_name") or ""
+                
+                # 强制使用 lcbh 逻辑
+                key_field = "lcbh"
+                key_val = str(pid0 or "")
+                if key_val:
+                    fields_obj["lcbh"] = key_val
+                
+                data_json = json.dumps(fields_obj, ensure_ascii=False)
+                import_mode = "upsert"
+                
+                sid = st.session_state.get("current_sid", SID)
+                wrote = _upsert_entity_row(type_name, key_field, key_val, sid, final_name, data_json, meta, import_mode=import_mode)
+                wrote_sum += int(wrote or 0)
+            pg.progress(100, text=f"批量入库（合并）：{total}/{total}，预计剩余 0秒")
+            st.success(f"批量入库完成（按lcbh合并）：写入 {wrote_sum} 条")
+
+        elif st.button("批量修复状态字段（当前流程）", key=f"fix_all_status_{flow_sel}"):
+            rows = _build_instance_rows()
+            def _match_flow(r):
+                return str(r.get("flow_define_name","")) == str(flow_sel)
+            view = [r for r in rows if _match_flow(r)]
+            pids_all = [r.get("proc_inst_id") for r in view]
+            pg = st.progress(0)
+            total = len(pids_all)
+            wrote_sum = 0
+            rev = {'待提交':'0','审批中':'1','审批通过':'2','审批不通过':'3','已取消':'4','已回退':'5'}
+            start_ts = time.time()
+            for i, pid0 in enumerate(pids_all or []):
+                pct = int(((i) / (total or 1)) * 100)
+                pg.progress(pct, text=f"修复中：{i}/{total}")
+                if not pid0:
+                    continue
+                bundle = _build_flow_import_bundle(pid0)
+                concl = bundle.get("concl") or ""
+                code = rev.get(concl, "")
+                type_name = bundle.get("type_name") or ""
+                key_field = bundle.get("key_field") or "id"
+                key_val = bundle.get("key_val") or str(pid0 or "")
+                sid = st.session_state.get("current_sid", SID)
+                patch_obj = {"lcspzt": concl, "lcspzt_label": concl}
+                now_ts = int(time.time())
+                meta_fix = {"del": 0, "input_date": now_ts, "update_date": now_ts}
+                wrote = _upsert_entity_row(type_name, key_field, key_val, sid, "", json.dumps(patch_obj, ensure_ascii=False), meta_fix, import_mode="update_merge")
+                wrote_sum += int(wrote or 0)
+            pg.progress(100, text=f"修复中：{total}/{total}")
+            st.success(f"批量修复完成：写入 {wrote_sum} 条")
         elif st.button("批量入库源表流程数据", key=f"import_src_flow_{flow_sel}"):
             fm = get_flow_entity_map(flow_sel)
             tbl = fm.get("source_table") or ""
@@ -2931,8 +3176,19 @@ def render_flow_mgmt():
                 pg = st.progress(0)
                 total = len(rows_src)
                 wrote_sum = 0
+                start_ts = time.time()
+                def _fmt_eta(s):
+                    try:
+                        m, ss = divmod(int(s), 60)
+                        return f"{m}分{ss}秒" if m else f"{ss}秒"
+                    except Exception:
+                        return "--"
                 for i, r in enumerate(rows_src or []):
-                    pg.progress(int(((i) / (total or 1)) * 100))
+                    done = i
+                    pct = int(((done) / (total or 1)) * 100)
+                    elapsed = max(time.time() - start_ts, 0.001)
+                    eta = int((total - done) * (elapsed / max(done, 1)))
+                    pg.progress(pct, text=f"批量入库：{done}/{total}，预计剩余 {_fmt_eta(eta)}")
                     script = get_table_script(tbl, tgt_entity or None) or ""
                     mapped, out_name, type_override = apply_record_mapping(tbl, r, script, target_entity=tgt_entity or "")
                     meta = _extract_entity_meta(mapped)
@@ -2948,15 +3204,22 @@ def render_flow_mgmt():
                         fld = data_bundle.get("fields_obj") or {}
                         if used_match:
                             merged_obj = dict(mapped)
-                            merged_obj["source_flow"] = fld.get("source_flow", "")
+                            # merged_obj["source_flow"] = fld.get("source_flow", "")
                             merged_obj["flow_md"] = flow_md
+                            merged_obj["flow_md_label"] = flow_md
+                            merged_obj["lcspzt"] = (data_bundle.get("concl") or "")
+                            merged_obj["lcspzt_label"] = (data_bundle.get("concl") or "")
                             merged_obj["lcbh"] = (fld.get("lcbh", "") or pid0)
                             merged_obj["sqsj"] = fld.get("sqsj", "")
+                            merged_obj["jssj"] = fld.get("jssj", "")
                             data_json = json.dumps(merged_obj, ensure_ascii=False)
                             import_mode = "upsert"
                         else:
+                            mapped["lcspzt"] = (data_bundle.get("concl") or "")
+                            mapped["lcspzt_label"] = (data_bundle.get("concl") or "")
                             mapped["lcbh"] = (fld.get("lcbh", "") or pid0)
                             mapped["sqsj"] = fld.get("sqsj", "")
+                            mapped["jssj"] = fld.get("jssj", "")
                             data_json = json.dumps(mapped, ensure_ascii=False)
                             import_mode = "upsert"
                     else:
@@ -2965,7 +3228,7 @@ def render_flow_mgmt():
                     sid = st.session_state.get("current_sid", SID)
                     wrote = _upsert_entity_row(type_name, key_field, key_val, sid, final_name, data_json, meta, import_mode=import_mode)
                     wrote_sum += int(wrote or 0)
-                pg.progress(100)
+                pg.progress(100, text=f"批量入库：{total}/{total}，预计剩余 0秒")
                 st.success(f"批量入库完成：写入 {wrote_sum} 条")
 
     with super_tabs[2]:
@@ -3270,7 +3533,8 @@ def render_file_mgmt():
             fname = ""
             if url:
                 tail = url.rsplit("/", 1)[-1].strip()
-                fname = tail or ""
+                # 优先使用 raw_name 作为文件名，如果没有才用 URL 尾部
+                fname = raw_name.strip() if raw_name.strip() else tail
             if not fname:
                 fname = raw_name.strip() or "unnamed"
             if "." in fname:
@@ -3278,6 +3542,12 @@ def render_file_mgmt():
                 ext = fname.split(".")[-1]
             else:
                 base, ext = fname, ""
+                # 如果 URL 有后缀，尝试补全 ext
+                if "." in url.rsplit("/", 1)[-1]:
+                    possible_ext = url.rsplit("/", 1)[-1].split(".")[-1]
+                    if possible_ext and len(possible_ext) < 6: # 简单校验
+                        ext = possible_ext
+            
             m = re.search(r"/defaultFile/(\d{8})/([^/]+)/", url)
             ymd = (m.group(1) if m else "")
             token = (m.group(2) if m else "")
@@ -3304,8 +3574,7 @@ def render_file_mgmt():
             r = next((x for x in rows if str(x.get("name","")) == full_name and str(x.get("path","")) .startswith(f"defaultFile/{ymd}/")), None)
             if r:
                 return r
-        r = next((x for x in rows if str(x.get("name","")) == full_name), None)
-        return r or {}
+        return {}
     def _get_upload_root():
         try:
             v = st.session_state.get("upload_root")
@@ -3341,13 +3610,34 @@ def render_file_mgmt():
             Path("outer_packet/config_data.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
-    def _build_file_row(eid: str, it: Dict[str, Any], fuid: str):
-        rel = f"../upload/files/{sid}/{it['yyyymm']}/{fuid}/{fuid}"
+    def _build_file_row(eid: str, it: Dict[str, Any], fuid: str, adaptive: bool = False):
+        if adaptive:
+            rel = f"/upload/{sid}/{fuid}/{fuid}"
+        else:
+            rel = f"../upload/files/{sid}/{it['yyyymm']}/{fuid}/{fuid}"
         src_info = it.get("source_info") or {}
-        data = json.dumps({"path": None, "source_id": src_info.get("id"), "source_url": src_info.get("url"), "source_path": src_info.get("path")}, ensure_ascii=False)
+        
+        # 修正 data 中的 name：必须与 file 表中的 name (即 raw_name) 一致
+        # 注意：这里的 data 存入 entity 表，应该反映真实的原始文件名（无扩展名或有扩展名取决于需求，通常是纯名）
+        # 用户需求：写入的文件名用 @ 前面的部分
+        # it["name"] 已经是处理过的 base name，it["ext"] 是后缀
+        # 但 file 表需要完整的文件名（带后缀），所以这里 data 里的 name 也最好保持一致
+        # 不过根据之前的逻辑，it["name"] 是 base, 下面的 full_name 是 base.ext
+        
+        # 修正 file 表的 name：
+        full_name = it.get("name","") + (f".{it.get('ext','')}" if it.get("ext") else "")
+        
+        data = json.dumps({
+            "path": None, 
+            "source_id": src_info.get("id"), 
+            "source_url": src_info.get("url"), 
+            "source_path": src_info.get("path"),
+            "name": full_name  # 显式存入 name 到 data
+        }, ensure_ascii=False)
+        
         def _resolve_config_uid() -> str:
             if mode != "文档目录":
-                return "root"
+                return "entity" if adaptive else "root"
             cid = ((doc_uuid or "").strip() or "mahndrn6w7")
             name = (doc_name or "").strip()
             if not name:
@@ -3444,9 +3734,17 @@ def render_file_mgmt():
             "del": 0, "state": 0, "filecrypt": 0, "oss": 0, "privilege": ""
             , "_usr_update_epoch": usr_update_epoch
         }
-    def _save_local_file(it: Dict[str, Any], fuid: str):
+    def _save_local_file(it: Dict[str, Any], fuid: str, adaptive: bool = False):
         import os, shutil
-        base = Path(_get_upload_root()) / sid / it["yyyymm"] / fuid
+        from pathlib import Path
+        root = Path(_get_upload_root())
+        if adaptive:
+            if root.name == "files":
+                base = root.parent / sid / fuid
+            else:
+                base = root / sid / fuid
+        else:
+            base = root / sid / it["yyyymm"] / fuid
         base.mkdir(parents=True, exist_ok=True)
         ext = it.get("ext", "")
         dst_path = base / fuid
@@ -3455,7 +3753,7 @@ def render_file_mgmt():
             src_row = _infra_match_row(it)
             it["source_info"] = {"id": src_row.get("id"), "url": src_row.get("url"), "path": src_row.get("path"), "size": src_row.get("size", 0)}
             expect_size = int((it["source_info"] or {}).get("size") or _infra_expect_size(it.get("name",""), ext) or 0)
-            src_path = _find_local_file(it.get("name",""), ext, expect_size)
+            src_path = _find_local_file(it.get("name",""), ext, expect_size, expected_token=str(it.get("token","")), expected_ymd=str(it.get("yyyymmdd","")))
             if src_path:
                 shutil.copyfile(src_path, dst_path)
                 size = os.path.getsize(dst_path)
@@ -3491,15 +3789,29 @@ def render_file_mgmt():
             return 0
         finally:
             conn.close()
-    def _update_entity_files(eid: str, files: list):
+    def _update_entity_files(eid: str, files: list, adaptive: bool = False):
         from backend.mapper_core import update_entity_data_by_uuid
-        names = [((x.get("name") + ("." + x.get("type") if x.get("type") else ""))) for x in files]
+        
+        # 统一名称逻辑：始终带后缀
+        def _fmt_name(x):
+            nm = x.get("name", "")
+            ext = x.get("type", "") # 这里的 type 是后缀
+            # 如果名字里没有包含后缀，则补全
+            if ext and not nm.endswith(f".{ext}"):
+                return f"{nm}.{ext}"
+            return nm
+
+        names = [_fmt_name(x) for x in files]
         uids = [x["uuid"] for x in files]
         patch = {}
         if entity_field:
             patch[f"{entity_field}_upload"] = " ".join(names)
             patch[f"{entity_field}_label"] = names
-            patch[f"{entity_field}"] = uids
+            if adaptive:
+                # Java 风格：需要完整的 URL 和带后缀的 name
+                patch[f"{entity_field}"] = [{"url": x["file"], "name": _fmt_name(x), "uuid": x["uuid"]} for x in files]
+            else:
+                patch[f"{entity_field}"] = uids
         return update_entity_data_by_uuid(eid, patch)
     _LOCAL_FILE_INDEX = {}
     def _infra_expect_size(name: str, ext: str) -> int:
@@ -3515,29 +3827,42 @@ def render_file_mgmt():
         except Exception:
             return 0
         return 0
-    def _find_local_file(name: str, ext: str, expected_size: int = 0) -> str:
+    def _find_local_file(name: str, ext: str, expected_size: int = 0, expected_token: str = "", expected_ymd: str = "") -> str:
         from pathlib import Path
         import os
         key = f"{name}.{ext}" if ext else name
-        cache_key = f"{key}::{expected_size or 0}"
+        cache_key = f"{key}::{expected_size or 0}::{expected_token or ''}::{expected_ymd or ''}"
         if cache_key in _LOCAL_FILE_INDEX:
             return _LOCAL_FILE_INDEX[cache_key]
-        base = Path("source/files")
-        try:
-            candidates = list(base.rglob(key))
-            if expected_size and candidates:
-                for p in candidates:
-                    try:
-                        if os.path.getsize(str(p)) == int(expected_size):
-                            _LOCAL_FILE_INDEX[cache_key] = str(p.resolve())
-                            return _LOCAL_FILE_INDEX[cache_key]
-                    except Exception:
-                        continue
-            if candidates:
-                _LOCAL_FILE_INDEX[cache_key] = str(candidates[0].resolve())
-                return _LOCAL_FILE_INDEX[cache_key]
-        except Exception:
-            pass
+        bases = [Path("source/files")]
+        candidates = []
+        for base in bases:
+            try:
+                if base.exists():
+                    candidates.extend(list(base.rglob(key)))
+            except Exception:
+                pass
+        
+        # 路径严格比较：如提供 token/ymd，则仅在路径包含该提示时才认为候选有效
+        if candidates:
+            def ok_path(pstr: str) -> bool:
+                if expected_token:
+                    return expected_token in pstr
+                if expected_ymd:
+                    return expected_ymd in pstr
+                return True
+            filtered = [p for p in candidates if ok_path(str(p))]
+            if filtered:
+                found = filtered[0]
+                if found.is_dir():
+                    # 尝试在目录中查找 MinIO 数据文件 (part.1)
+                    parts = list(found.rglob("part.1"))
+                    if parts:
+                        found = parts[0]
+                
+                if found.is_file():
+                    _LOCAL_FILE_INDEX[cache_key] = str(found.resolve())
+                    return _LOCAL_FILE_INDEX[cache_key]
         _LOCAL_FILE_INDEX[cache_key] = ""
         return ""
     def _show_file_preview(items: list):
@@ -3563,6 +3888,14 @@ def render_file_mgmt():
     if st.button("保存写入路径", key="save_upload_root"):
         _set_upload_root(upload_root_input or upload_default)
         st.success("写入路径已保存")
+    st.caption("性能设置")
+    perf_cols = st.columns([1,1,1])
+    with perf_cols[0]:
+        max_workers = st.number_input("并发拷贝线程", value=4, min_value=1, max_value=32, step=1, key="file_thr_workers")
+    with perf_cols[1]:
+        batch_size = st.number_input("数据库批大小", value=200, min_value=50, max_value=1000, step=50, key="file_batch_size")
+    with perf_cols[2]:
+        progress_step = st.number_input("进度步长(条)", value=50, min_value=1, max_value=10000, step=10, key="file_progress_step")
     with rec_cols[1]:
         preview_btn = st.button("解析预览", key="file_map_preview")
     with rec_cols[2]:
@@ -3570,6 +3903,7 @@ def render_file_mgmt():
     with rec_cols[3]:
         apply_btn = st.button("一键写入", key="file_map_apply")
     apply_by_entity_btn = st.button("按实体写入", key="file_map_apply_by_entity")
+    apply_by_entity_adaptive_btn = st.button("按实体写入（适应JAVA版本）", key="file_map_apply_by_entity_adaptive")
     save_cfg_btn = st.button("保存映射配置", key="file_map_save")
     if save_cfg_btn:
         cfg = {
@@ -3631,7 +3965,7 @@ def render_file_mgmt():
                         it["source_info"] = {"id": src_row.get("id"), "url": src_row.get("url"), "path": src_row.get("path"), "size": src_row.get("size", 0)}
                         file_row = _build_file_row(e_uuid, it, fuid)
                         expect_size = int((it["source_info"] or {}).get("size") or _infra_expect_size(file_row["name"], file_row["type"]) or 0)
-                        local_path = _find_local_file(file_row["name"], file_row["type"], expect_size) 
+                        local_path = _find_local_file(file_row["name"], file_row["type"], expect_size, expected_token=str(it.get("token","")), expected_ymd=str(it.get("yyyymmdd",""))) 
                         file_url = f"file://{local_path}" if local_path else ""
                         rows_preview.append({
                             "record_id": r.get("id"),
@@ -3648,7 +3982,7 @@ def render_file_mgmt():
                         src_row2 = _infra_match_row(it)
                         it["source_info"] = {"id": src_row2.get("id"), "url": src_row2.get("url"), "path": src_row2.get("path"), "size": src_row2.get("size", 0)}
                         expect_size2 = int((it["source_info"] or {}).get("size") or _infra_expect_size(it.get("name",""), it.get("ext","")) or 0)
-                        local_path = _find_local_file(it.get("name",""), it.get("ext",""), expect_size2)
+                        local_path = _find_local_file(it.get("name",""), it.get("ext",""), expect_size2, expected_token=str(it.get("token","")), expected_ymd=str(it.get("yyyymmdd","")))
                         file_url = f"file://{local_path}" if local_path else ""
                         rows_preview.append({
                             "record_id": r.get("id"),
@@ -3679,38 +4013,55 @@ def render_file_mgmt():
             from custom_handler import fetch_field_uuid
             all_files = []
             files_by_eid = {}
-            total_items = 0
+            items_all = []
             for r in view:
                 key_val = r.get(sql_field, "")
                 entity_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
                 if not entity_uuid:
                     continue
                 src_val = str(r.get(src_field, "") or "")
-                items = _parse_files(src_val)
-                total_items += len(items)
+                for it in _parse_files(src_val):
+                    items_all.append((entity_uuid, it))
+            total_items = len(items_all)
             prog = st.progress(0)
             done = 0
-            for r in view:
-                key_val = r.get(sql_field, "")
-                entity_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
-                if not entity_uuid:
-                    continue
-                src_val = str(r.get(src_field, "") or "")
-                items = _parse_files(src_val)
-                for it in items:
+            start_ts = time.time()
+            def _fmt_eta(s):
+                try:
+                    m, ss = divmod(int(s), 60)
+                    return f"{m}分{ss}秒" if m else f"{ss}秒"
+                except Exception:
+                    return "--"
+            if items_all:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                def _proc(eid, it):
                     fuid = gen_uuid10()
                     size = _save_local_file(it, fuid)
-                    row = _build_file_row(entity_uuid, it, fuid)
+                    row = _build_file_row(eid, it, fuid)
                     row["size"] = size
-                    all_files.append(row)
-                    files_by_eid.setdefault(entity_uuid, []).append(row)
-                    done += 1
-                    if total_items:
-                        prog.progress(min(1.0, done/total_items))
+                    return eid, row
+                with ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
+                    futs = [ex.submit(_proc, eid, it) for eid, it in items_all]
+                    step = max(1, int(progress_step))
+                    for i, f in enumerate(as_completed(futs), start=1):
+                        eid, row = f.result()
+                        all_files.append(row)
+                        files_by_eid.setdefault(eid, []).append(row)
+                        done += 1
+                        if i % step == 0 or i == total_items:
+                            elapsed = max(time.time() - start_ts, 0.001)
+                            eta = int((total_items - done) * (elapsed / max(done, 1)))
+                            prog.progress(min(1.0, done/max(1,total_items)), text=f"解析与写入准备：{done}/{total_items}，预计剩余 {_fmt_eta(eta)}")
             if not all_files:
                 st.warning("无可写入的文件（可能实体未匹配或源字段为空）")
             else:
-                n1 = _write_files(all_files)
+                if int(batch_size) > 0 and len(all_files) > int(batch_size):
+                    n1 = 0
+                    bs = int(batch_size)
+                    for i in range(0, len(all_files), bs):
+                        n1 += _write_files(all_files[i:i+bs])
+                else:
+                    n1 = _write_files(all_files)
                 try:
                     from backend.sql_utils import get_conn
                     conn = get_conn()
@@ -3771,41 +4122,147 @@ def render_file_mgmt():
         else:
             all_files = []
             files_by_eid = {}
-            total_items = 0
+            items_all = []
             for e in ents:
                 try:
                     data = json.loads(e.get("data") or "{}")
                 except Exception:
                     data = {}
                 mv = str((data or {}).get(match_entity_field, "") or "")
-                total_items += len(idx.get(mv, []))
+                for it in idx.get(mv, []) or []:
+                    items_all.append((e.get("uuid"), it))
+            total_items = len(items_all)
             prog = st.progress(0)
             done = 0
-            for e in ents:
-                eid = e.get("uuid")
+            start_ts = time.time()
+            def _fmt_eta(s):
                 try:
-                    data = json.loads(e.get("data") or "{}")
+                    m, ss = divmod(int(s), 60)
+                    return f"{m}分{ss}秒" if m else f"{ss}秒"
                 except Exception:
-                    data = {}
-                mv = str((data or {}).get(match_entity_field, "") or "")
-                for it in idx.get(mv, []):
+                    return "--"
+            if items_all:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                def _proc(eid, it):
                     fuid = gen_uuid10()
                     size = _save_local_file(it, fuid)
                     row = _build_file_row(eid, it, fuid)
                     row["size"] = size
-                    all_files.append(row)
-                    files_by_eid.setdefault(eid, []).append(row)
-                    done += 1
-                    if total_items:
-                        prog.progress(min(1.0, done/total_items))
+                    return eid, row
+                with ThreadPoolExecutor(max_workers=int(st.session_state.get("file_thr_workers", 4))) as ex:
+                    futs = [ex.submit(_proc, eid, it) for eid, it in items_all]
+                    step = max(1, int(st.session_state.get("file_progress_step", 50)))
+                    for i, f in enumerate(as_completed(futs), start=1):
+                        eid, row = f.result()
+                        all_files.append(row)
+                        files_by_eid.setdefault(eid, []).append(row)
+                        done += 1
+                        if i % step == 0 or i == total_items:
+                            elapsed = max(time.time() - start_ts, 0.001)
+                            eta = int((total_items - done) * (elapsed / max(done, 1)))
+                            prog.progress(min(1.0, done/max(1,total_items)), text=f"按实体解析：{done}/{total_items}，预计剩余 {_fmt_eta(eta)}")
             if not all_files:
                 st.info("无可写入文件")
             else:
-                n1 = _write_files(all_files)
+                bs = int(st.session_state.get("file_batch_size", 200))
+                if bs > 0 and len(all_files) > bs:
+                    n1 = 0
+                    for i in range(0, len(all_files), bs):
+                        n1 += _write_files(all_files[i:i+bs])
+                else:
+                    n1 = _write_files(all_files)
                 n2_total = 0
                 for eid, files in files_by_eid.items():
                     n2_total += _update_entity_files(eid, files)
                 st.success(f"按实体写入完成：file {n1} 条，更新 entity {n2_total} 条")
+    if apply_by_entity_adaptive_btn:
+        from backend.sql_utils import get_conn, json_equals_clause
+        rows = _read_sql_rows(src_table)
+        idx = {}
+        for r in rows:
+            val = str(r.get(sql_field, "") or "")
+            items = _parse_files(str(r.get(src_field, "") or ""))
+            if not items:
+                continue
+            idx.setdefault(val, []).extend(items)
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                ents = []
+                if rec_id:
+                    cur.execute(
+                        f"SELECT uuid,data FROM entity WHERE type=%s AND {json_equals_clause('data', match_entity_field)}",
+                        (entity_type, str(rec_id))
+                    )
+                else:
+                    cur.execute("SELECT uuid,data FROM entity WHERE type=%s", (entity_type,))
+                rows_ent = cur.fetchall() or []
+                for e in rows_ent:
+                    try:
+                        eu, dj = e[0], e[1]
+                        ents.append({"uuid": eu, "data": dj})
+                    except Exception:
+                        continue
+        finally:
+            conn.close()
+        if not ents:
+            st.info("无匹配实体")
+        else:
+            all_files = []
+            files_by_eid = {}
+            items_all = []
+            for e in ents:
+                try:
+                    data = json.loads(e.get("data") or "{}")
+                except Exception:
+                    data = {}
+                mv = str((data or {}).get(match_entity_field, "") or "")
+                for it in idx.get(mv, []) or []:
+                    items_all.append((e.get("uuid"), it))
+            total_items = len(items_all)
+            prog = st.progress(0)
+            done = 0
+            start_ts = time.time()
+            def _fmt_eta(s):
+                try:
+                    m, ss = divmod(int(s), 60)
+                    return f"{m}分{ss}秒" if m else f"{ss}秒"
+                except Exception:
+                    return "--"
+            if items_all:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                def _proc(eid, it):
+                    fuid = gen_uuid10()
+                    size = _save_local_file(it, fuid, adaptive=True)
+                    row = _build_file_row(eid, it, fuid, adaptive=True)
+                    row["size"] = size
+                    return eid, row
+                with ThreadPoolExecutor(max_workers=int(st.session_state.get("file_thr_workers", 4))) as ex:
+                    futs = [ex.submit(_proc, eid, it) for eid, it in items_all]
+                    step = max(1, int(st.session_state.get("file_progress_step", 50)))
+                    for i, f in enumerate(as_completed(futs), start=1):
+                        eid, row = f.result()
+                        all_files.append(row)
+                        files_by_eid.setdefault(eid, []).append(row)
+                        done += 1
+                        if i % step == 0 or i == total_items:
+                            elapsed = max(time.time() - start_ts, 0.001)
+                            eta = int((total_items - done) * (elapsed / max(done, 1)))
+                            prog.progress(min(1.0, done/max(1,total_items)), text=f"按实体解析（适应版本）：{done}/{total_items}，预计剩余 {_fmt_eta(eta)}")
+            if not all_files:
+                st.info("无可写入文件")
+            else:
+                bs = int(st.session_state.get("file_batch_size", 200))
+                if bs > 0 and len(all_files) > bs:
+                    n1 = 0
+                    for i in range(0, len(all_files), bs):
+                        n1 += _write_files(all_files[i:i+bs])
+                else:
+                    n1 = _write_files(all_files)
+                n2_total = 0
+                for eid, files in files_by_eid.items():
+                    n2_total += _update_entity_files(eid, files, adaptive=True)
+                st.success(f"按实体写入（适应JAVA版本）完成：file {n1} 条，更新 entity {n2_total} 条")
     if st.button("刷新", key="file_map_refresh"):
         st.rerun()
 
@@ -3837,6 +4294,12 @@ def render_file_mgmt():
                             fdir = parts[5]
                             base = Path(_get_upload_root()) / sid_v / yyyymm_v / fdir
                             paths.append(base)
+                        # Java-style: /upload/sid/fuid/filename (parts=["", "upload", sid, fuid, filename])
+                        elif len(parts) >= 5 and parts[1] == "upload":
+                            sid_v = parts[2]
+                            fuid_v = parts[3]
+                            base = Path(_get_upload_root()).parent / sid_v / fuid_v
+                            paths.append(base)
                     except Exception:
                         continue
                 for p in paths:
@@ -3858,8 +4321,11 @@ def render_file_mgmt():
                         v = data.get(k)
                         if k.endswith("_upload") or k.endswith("_label"):
                             data.pop(k, None)
-                        elif isinstance(v, list) and all(isinstance(x, str) and len(x) == 10 for x in v):
-                            data.pop(k, None)
+                        elif isinstance(v, list):
+                            if all(isinstance(x, str) and len(x) == 10 for x in v):
+                                data.pop(k, None)
+                            elif all(isinstance(x, dict) and "url" in x and "uuid" in x for x in v):
+                                data.pop(k, None)
                     cur.execute("UPDATE entity SET data=%s, update_date=%s WHERE uuid=%s", (json.dumps(data, ensure_ascii=False), now_ts, eid))
             conn.commit()
             return len(rows), len(paths)
@@ -3890,6 +4356,12 @@ def render_file_mgmt():
                             yyyymm_v = parts[4]
                             fdir = parts[5]
                             base = Path(_get_upload_root()) / sid_v / yyyymm_v / fdir
+                            paths.append(base)
+                        # Java-style: /upload/sid/fuid/filename (parts=["", "upload", sid, fuid, filename])
+                        elif len(parts) >= 5 and parts[1] == "upload":
+                            sid_v = parts[2]
+                            fuid_v = parts[3]
+                            base = Path(_get_upload_root()).parent / sid_v / fuid_v
                             paths.append(base)
                     except Exception:
                         continue
@@ -4001,6 +4473,9 @@ def render_file_mgmt():
             etype = str(c.get('entity') or '').strip()
             if sqlf or matchf:
                 tail += f"【sql.{sqlf or '-'}={etype}.data.{matchf or '-'}】"
+            desc = str(c.get("description") or "").strip()
+            if desc:
+                tail += f"【{desc}】"
             return base + tail
         options = [
             {
@@ -4013,7 +4488,7 @@ def render_file_mgmt():
         sel = st.selectbox("选择入库配置", options=labels, index=0)
         sel_id = next((o["id"] for o in options if o["label"] == sel), cfgs[0]["id"]) if options else 0
         rec_id2 = st.text_input("记录ID（为空则全表）", key="file_imp_rec_id")
-        row1 = st.columns([1,1,1,1,1])
+        row1 = st.columns([1,1,1,1,1,1.5])
         with row1[0]:
             do_prev = st.button("入库预览", key="file_imp_prev")
         with row1[1]:
@@ -4024,8 +4499,10 @@ def render_file_mgmt():
             do_rm_cfg = st.button("删除配置", key="file_imp_rm_cfg")
         with row1[4]:
             do_apply_by_entity = st.button("按实体写入", key="file_imp_apply_by_entity")
+        with row1[5]:
+            do_apply_by_entity_adaptive = st.button("按实体写入（适应JAVA版本）", key="file_imp_apply_by_entity_adaptive")
 
-        if do_prev or do_apply or do_del or do_apply_by_entity:
+        if do_prev or do_apply or do_del or do_apply_by_entity or do_apply_by_entity_adaptive:
             cfg = next((c for c in cfgs if c["id"] == sel_id), cfgs[0])
             # 注入上下文供已有逻辑复用
             mode = cfg.get("mode")
@@ -4081,6 +4558,13 @@ def render_file_mgmt():
                     total_items += len(_parse_files(src_val))
                 prog = st.progress(0)
                 done = 0
+                start_ts = time.time()
+                def _fmt_eta(s):
+                    try:
+                        m, ss = divmod(int(s), 60)
+                        return f"{m}分{ss}秒" if m else f"{ss}秒"
+                    except Exception:
+                        return "--"
                 for r in view:
                     key_val = r.get(sql_field, "")
                     e_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
@@ -4096,7 +4580,9 @@ def render_file_mgmt():
                         files_by_eid.setdefault(e_uuid, []).append(row)
                         done += 1
                         if total_items:
-                            prog.progress(min(1.0, done/total_items))
+                            elapsed = max(time.time() - start_ts, 0.001)
+                            eta = int((total_items - done) * (elapsed / max(done, 1)))
+                            prog.progress(min(1.0, done/total_items), text=f"入库：{done}/{total_items}，预计剩余 {_fmt_eta(eta)}")
                 if not all_files:
                     st.info("无可写入文件")
                 else:
@@ -4150,6 +4636,13 @@ def render_file_mgmt():
                         total_items += len(idx.get(mv, []))
                     prog = st.progress(0)
                     done = 0
+                    start_ts = time.time()
+                    def _fmt_eta(s):
+                        try:
+                            m, ss = divmod(int(s), 60)
+                            return f"{m}分{ss}秒" if m else f"{ss}秒"
+                        except Exception:
+                            return "--"
                     for e in ents:
                         eid = e.get("uuid")
                         try:
@@ -4166,7 +4659,9 @@ def render_file_mgmt():
                             files_by_eid.setdefault(eid, []).append(row)
                             done += 1
                             if total_items:
-                                prog.progress(min(1.0, done/total_items))
+                                elapsed = max(time.time() - start_ts, 0.001)
+                                eta = int((total_items - done) * (elapsed / max(done, 1)))
+                                prog.progress(min(1.0, done/total_items), text=f"按实体入库：{done}/{total_items}，预计剩余 {_fmt_eta(eta)}")
                     if not all_files:
                         st.info("无可写入文件")
                     else:
@@ -4177,6 +4672,85 @@ def render_file_mgmt():
                         from backend.db import update_file_map_status
                         update_file_map_status(sel_id, f"已入库({n1})")
                         st.success(f"按实体写入完成：file {n1} 条，更新 entity {n2_total} 条")
+            if do_apply_by_entity_adaptive:
+                idx = {}
+                for r in rows:
+                    val = str(r.get(sql_field, "") or "")
+                    items = _parse_files(str(r.get(src_field, "") or ""))
+                    if not items:
+                        continue
+                    idx.setdefault(val, []).extend(items)
+                from backend.sql_utils import get_conn, json_equals_clause
+                conn = get_conn()
+                ents = []
+                try:
+                    with conn.cursor() as cur:
+                        if rec_id2:
+                            cur.execute(
+                                f"SELECT uuid,data FROM entity WHERE type=%s AND {json_equals_clause('data', match_entity_field)}",
+                                (entity_type, str(rec_id2))
+                            )
+                        else:
+                            cur.execute("SELECT uuid,data FROM entity WHERE type=%s", (entity_type,))
+                        rows_ent = cur.fetchall() or []
+                        for e in rows_ent:
+                            try:
+                                ents.append({"uuid": e[0], "data": e[1]})
+                            except Exception:
+                                continue
+                finally:
+                    conn.close()
+                if not ents:
+                    st.info("无匹配实体")
+                else:
+                    all_files = []
+                    files_by_eid = {}
+                    total_items = 0
+                    for e in ents:
+                        try:
+                            data = json.loads(e.get("data") or "{}")
+                        except Exception:
+                            data = {}
+                        mv = str((data or {}).get(match_entity_field, "") or "")
+                        total_items += len(idx.get(mv, []))
+                    prog = st.progress(0)
+                    done = 0
+                    start_ts = time.time()
+                    def _fmt_eta(s):
+                        try:
+                            m, ss = divmod(int(s), 60)
+                            return f"{m}分{ss}秒" if m else f"{ss}秒"
+                        except Exception:
+                            return "--"
+                        for e in ents:
+                            eid = e.get("uuid")
+                            try:
+                                data = json.loads(e.get("data") or "{}")
+                            except Exception:
+                                data = {}
+                            mv = str((data or {}).get(match_entity_field, "") or "")
+                            for it in idx.get(mv, []):
+                                fuid = gen_uuid10()
+                                size = _save_local_file(it, fuid, adaptive=True)
+                                row = _build_file_row(eid, it, fuid, adaptive=True)
+                                row["size"] = size
+                                all_files.append(row)
+                                files_by_eid.setdefault(eid, []).append(row)
+                                done += 1
+                            if total_items:
+                                elapsed = max(time.time() - start_ts, 0.001)
+                                eta = int((total_items - done) * (elapsed / max(done, 1)))
+                                prog.progress(min(1.0, done/total_items), text=f"按实体写入（适应JAVA）：{done}/{total_items}，预计剩余 {_fmt_eta(eta)}")
+                    if not all_files:
+                        st.info("无可写入文件")
+                    else:
+                        n1 = _write_files(all_files)
+                        n2_total = 0
+                        for eid, files in files_by_eid.items():
+                            n2_total += _update_entity_files(eid, files, adaptive=True)
+                        from backend.db import update_file_map_status
+                        update_file_map_status(sel_id, f"已入库({n1})")
+                        st.success(f"按实体写入（适应JAVA）完成：file {n1} 条，更新 entity {n2_total} 条")
             if do_del:
                 total_db, total_fs = 0, 0
                 for r in view:

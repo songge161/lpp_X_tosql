@@ -30,9 +30,21 @@ def init_db():
         disabled INTEGER DEFAULT 0,
         description TEXT DEFAULT '',
         py_script TEXT DEFAULT '',
+        filter_sql TEXT DEFAULT '',
         UNIQUE(source_table, target_entity)
     );
     """)
+
+    # ✅ 自动修复旧表缺少 filter_sql 的情况
+    try:
+        cur.execute("PRAGMA table_info(table_map);")
+        cols = [r[1] for r in cur.fetchall()]
+        if "filter_sql" not in cols:
+            cur.execute("ALTER TABLE table_map ADD COLUMN filter_sql TEXT DEFAULT '';")
+            conn.commit()
+            print("[init_db] 已为 table_map 增加 filter_sql 列。")
+    except Exception as e:
+        print("[init_db] 检查 table_map 列失败:", e)
 
     # --- 字段映射表 field_map ---
     cur.execute("""
@@ -337,7 +349,16 @@ def clear_access_cache(source_kind: str = None, conn_key: str = None) -> int:
 def list_file_map_cfgs() -> List[Dict[str, Any]]:
     conn = _conn()
     cur = conn.cursor()
-    cur.execute("SELECT id, source_table, source_field, entity, mode, entity_field, doc_uuid, doc_name, sql_field, match_entity_field, saved_at, status FROM file_map_cfgs ORDER BY saved_at DESC, id DESC")
+    # 关联 table_map 获取描述信息
+    cur.execute("""
+        SELECT 
+            f.id, f.source_table, f.source_field, f.entity, f.mode, f.entity_field, 
+            f.doc_uuid, f.doc_name, f.sql_field, f.match_entity_field, f.saved_at, f.status,
+            t.description
+        FROM file_map_cfgs f
+        LEFT JOIN table_map t ON t.source_table = f.source_table AND t.target_entity = f.entity
+        ORDER BY f.saved_at DESC, f.id DESC
+    """)
     rows = [
         {
             "id": int(r[0]),
@@ -352,6 +373,7 @@ def list_file_map_cfgs() -> List[Dict[str, Any]]:
             "match_entity_field": r[9] or "",
             "saved_at": int(r[10] or 0),
             "status": r[11] or "",
+            "description": r[12] or "",
         }
         for r in cur.fetchall()
     ]
@@ -715,6 +737,43 @@ def save_table_script(source_table: str, py_script: str, target_entity: str = No
     else:
         # 兼容旧用法：无 entity 时更新该表下所有行（不建议用）
         cur.execute("UPDATE table_map SET py_script=? WHERE source_table=?", (py_script, source_table))
+        conn.commit()
+        conn.close()
+        return cur.rowcount > 0
+
+
+def get_table_filter_sql(source_table: str, target_entity: str = None) -> str:
+    conn = _conn()
+    cur = conn.cursor()
+    if target_entity:
+        cur.execute(
+            "SELECT filter_sql FROM table_map WHERE source_table=? AND target_entity=?",
+            (source_table, target_entity)
+        )
+    else:
+        cur.execute(
+            "SELECT filter_sql FROM table_map WHERE source_table=? ORDER BY priority DESC LIMIT 1",
+            (source_table,)
+        )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else ""
+
+
+def save_table_filter_sql(source_table: str, filter_sql: str, target_entity: str = None) -> bool:
+    conn = _conn()
+    cur = conn.cursor()
+    if target_entity:
+        cur.execute(
+            "UPDATE table_map SET filter_sql=? WHERE source_table=? AND target_entity=?",
+            (filter_sql, source_table, target_entity)
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+        conn.close()
+        return updated
+    else:
+        cur.execute("UPDATE table_map SET filter_sql=? WHERE source_table=?", (filter_sql, source_table))
         conn.commit()
         conn.close()
         return cur.rowcount > 0

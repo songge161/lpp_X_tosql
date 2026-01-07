@@ -146,3 +146,24 @@ streamlit run app.py
 - "会议管理审批流程" → `ct_meeting_manage` → 目标 `hyglsplc`
 
 说明：上述映射维护在 `mapping_config.db` 的 `flow_entity_map` 表中，可通过界面或后台方法进行增删改（backend/db.py:117-151）。
+
+
+
+# 附录：常用的rule
+
+**源表SQL查询**
+sql.ct_project_base_info(id=record.project_id).project_name
+
+
+
+**选择器**
+py:{'1':'是','0':'否'}.get()
+
+**时间**
+
+date(%Y-%m-%d,)
+
+**拓展字**
+
+record.||'年'
+
