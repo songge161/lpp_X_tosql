@@ -115,6 +115,15 @@ def init_db():
         );
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            k TEXT PRIMARY KEY,
+            v TEXT DEFAULT '',
+            updated_at INTEGER DEFAULT 0
+        );
+        """
+    )
     try:
         cur.execute("PRAGMA table_info(access_cache)")
         cols = [r[1] for r in cur.fetchall()]
@@ -180,6 +189,44 @@ def init_from_sql():
         """, (tname, "", 0, 0, ""))
     conn.commit()
     conn.close()
+
+def get_app_setting(key: str, default: str = "") -> str:
+    if not key:
+        return default
+    conn = _conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT v FROM app_settings WHERE k=? LIMIT 1", (key,))
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            return str(row[0])
+        return default
+    except Exception:
+        return default
+    finally:
+        conn.close()
+
+def set_app_setting(key: str, value: Any) -> bool:
+    if not key:
+        return False
+    conn = _conn()
+    cur = conn.cursor()
+    try:
+        now_ts = int(time.time())
+        cur.execute(
+            "INSERT OR REPLACE INTO app_settings(k, v, updated_at) VALUES (?,?,?)",
+            (key, "" if value is None else str(value), now_ts)
+        )
+        conn.commit()
+        return True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        conn.close()
 
 def list_table_targets(table_name: str) -> List[str]:
     conn = _conn()

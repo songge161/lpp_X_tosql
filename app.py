@@ -16,7 +16,8 @@ from backend.db import (
     export_all, import_all,
     rename_table_target_entity,
     list_table_targets,
-    get_flow_entity_map, upsert_flow_entity_map, list_flow_entity_maps
+    get_flow_entity_map, upsert_flow_entity_map, list_flow_entity_maps,
+    get_app_setting, set_app_setting
 )
 from backend.source_fields import detect_source_fields, detect_sql_path,detect_field_comments, detect_table_title
 from backend.mapper_core import apply_record_mapping, check_entity_status, import_table_data, delete_table_data, clear_sql_cache, _parse_sql_file, _extract_entity_meta, _upsert_entity_row
@@ -1780,8 +1781,9 @@ def render_table_detail(table_name: str):
     full_list = st.session_state[samples_key]
     
     # ✅ 自动加载并执行已保存的 SQL 筛选 (防止刷新后丢失)
-    filter_key = f"filter_{table_name}"
-    if filter_key not in st.session_state:
+    sql_filter_key = f"sql_filter_{table_name}"
+    find_filter_key = f"find_filter_{table_name}"
+    if sql_filter_key not in st.session_state:
          from backend.db import get_table_filter_sql
          saved_sql = get_table_filter_sql(table_name, target_entity or st.session_state.get("current_entity") or "")
          if saved_sql and saved_sql.strip():
@@ -1791,7 +1793,7 @@ def render_table_detail(table_name: str):
              if res and isinstance(res, list) and len(res) > 0 and "error" in res[0]:
                  st.warning(f"自动加载筛选失败: {res[0]['error']}")
              else:
-                 st.session_state[filter_key] = res
+                 st.session_state[sql_filter_key] = res
                  # 同步到高级 SQL 文本框的 session
                  st.session_state[f"adv_sql_{table_name}"] = saved_sql
 
@@ -1807,7 +1809,6 @@ def render_table_detail(table_name: str):
     with sf4:
         do_query = st.button("查询", key=f"do_query_{table_name}")
 
-    filter_key = f"filter_{table_name}"
     idx_key = f"sample_idx_{table_name}"
 
     if do_query:
@@ -1820,20 +1821,22 @@ def render_table_detail(table_name: str):
                     return False
                 s = str(rv)
                 return (val in s) if q_contains else (s == val)
-            st.session_state[filter_key] = [r for r in full_list if _match(r)]
+            base_list = st.session_state.get(sql_filter_key) or full_list
+            st.session_state[find_filter_key] = [r for r in base_list if _match(r)]
             st.session_state[idx_key] = 0
-            st.info(f"筛选到 {len(st.session_state[filter_key])} 条记录（总 {len(full_list)} 条）")
+            st.info(f"筛选到 {len(st.session_state[find_filter_key])} 条记录（总 {len(base_list)} 条）")
         else:
             st.warning("请填写字段名与字段值后再查询。")
 
     # 清除筛选
-    if st.button("清除筛选", key=f"clear_query_{table_name}"):
-        st.session_state.pop(filter_key, None)
+    if st.button("清除查找筛选", key=f"clear_query_{table_name}"):
+        st.session_state.pop(find_filter_key, None)
         st.session_state[idx_key] = 0
 
     # ================= 高级 SQL 筛选 =================
     with st.expander("高级 SQL 筛选 (Advanced SQL Filter)", expanded=False):
         st.caption("支持完整 SQL 语法 (JOIN, GROUP BY, etc.)。数据源为 source/sql 下的 SQL 文件。")
+        st.caption("可选：首行支持 `-- params: {\"k\": \"v\"}`，并在 SQL 内用 `:k` 引用参数。")
         
         # Load saved SQL if session state not set
         if f"adv_sql_{table_name}" not in st.session_state:
@@ -1843,19 +1846,43 @@ def render_table_detail(table_name: str):
                  st.session_state[f"adv_sql_{table_name}"] = saved_sql
                  
         adv_sql = st.text_area("SQL 语句", value=st.session_state.get(f"adv_sql_{table_name}", f"SELECT * FROM {table_name}"), height=100)
+        preview_list = st.session_state.get(find_filter_key) or st.session_state.get(sql_filter_key) or full_list
+        cur_idx = int(st.session_state.get(idx_key, 0) or 0)
+        sample_for_params = preview_list[cur_idx] if (0 <= cur_idx < len(preview_list)) else {}
+        preview_sql = adv_sql
+        if "record." in (preview_sql or ""):
+            from backend.mapper_core import substitute_record_in_sql
+            preview_sql = substitute_record_in_sql(preview_sql, sample_for_params)
+            st.caption(f"预览：`record.xxx` 基于当前样例记录第 {cur_idx + 1} 条替换后执行/保存。")
+        with st.expander("参数与SQL预览", expanded=False):
+            if "record." in (adv_sql or ""):
+                st.caption("record 参数（来自当前样例记录）")
+                st.code(json.dumps({k: sample_for_params.get(k) for k in sample_for_params.keys()}, ensure_ascii=False, indent=2))
+            st.caption("实际执行 SQL")
+            st.code(preview_sql or "")
         if st.button("执行并保存筛选", key=f"btn_adv_sql_{table_name}"):
-            st.session_state[f"adv_sql_{table_name}"] = adv_sql
+            run_sql = adv_sql
+            if "record." in (run_sql or ""):
+                base_list = st.session_state.get(find_filter_key) or st.session_state.get(sql_filter_key) or full_list
+                cur_idx = int(st.session_state.get(idx_key, 0) or 0)
+                sample_for_params = base_list[cur_idx] if (0 <= cur_idx < len(base_list)) else {}
+                from backend.mapper_core import substitute_record_in_sql
+                run_sql = substitute_record_in_sql(run_sql, sample_for_params)
+                st.session_state[f"adv_sql_{table_name}"] = run_sql
+            else:
+                st.session_state[f"adv_sql_{table_name}"] = adv_sql
             
             # Save to DB
             from backend.db import save_table_filter_sql
-            save_table_filter_sql(table_name, adv_sql, current_entity)
+            save_table_filter_sql(table_name, run_sql, current_entity)
             
             from backend.mapper_core import query_source_sql
-            res = query_source_sql(adv_sql, table_name)
+            res = query_source_sql(run_sql, table_name)
             if res and isinstance(res, list) and len(res) > 0 and "error" in res[0]:
                 st.error(f"查询错误: {res[0]['error']}")
             else:
-                st.session_state[filter_key] = res
+                st.session_state[sql_filter_key] = res
+                st.session_state.pop(find_filter_key, None)
                 st.session_state[idx_key] = 0
                 st.success(f"筛选到 {len(res)} 条记录，配置已保存")
 
@@ -1865,10 +1892,7 @@ def render_table_detail(table_name: str):
     sample_index = st.session_state[idx_key]
 
     # 当前列表：优先过滤结果
-    if filter_key in st.session_state:
-        curr_list = st.session_state[filter_key]
-    else:
-        curr_list = full_list
+    curr_list = st.session_state.get(find_filter_key) or st.session_state.get(sql_filter_key) or full_list
     total_n = len(curr_list)
     st.caption(f"当前预览索引：{sample_index + 1}/{max(total_n, 1)}（总 {len(full_list)} 条）")
 
@@ -1953,7 +1977,7 @@ def render_table_detail(table_name: str):
         size = int(st.session_state.get(focus_page_size_key, 20))
 
         # 当前列表：优先过滤结果
-        curr_list = st.session_state.get(filter_key) or full_list
+        curr_list = st.session_state.get(find_filter_key) or st.session_state.get(sql_filter_key) or full_list
         total_n = len(curr_list)
         total_pages = max(1, (total_n + size - 1) // size)
         start = page * size
@@ -2017,6 +2041,13 @@ def render_mapped_tables():
         st.info("暂无已设置映射的表。请先在『源表列表』里为表设置 target_entity。")
         return
 
+    delete_lock_key = "lock_delete_mapped_tables"
+    locked = (get_app_setting(delete_lock_key, "0") == "1")
+    lock_now = st.checkbox("屏蔽删除按钮（防误删除，长期生效）", value=locked, key=delete_lock_key)
+    if lock_now != locked:
+        set_app_setting(delete_lock_key, "1" if lock_now else "0")
+        locked = lock_now
+
     # 顶部批量操作
     c1, c2, c3 = st.columns([1,1,6])
     with c1:
@@ -2032,6 +2063,7 @@ def render_mapped_tables():
             index=0,
             key="bulk_import_mode"
         )
+        bulk_sync_soft_delete = st.checkbox("同步清理未命中（del=1）", value=False, key="bulk_sync_soft_delete")
         if st.button("一键入库（全部）", type="primary"):
             total = 0
             progress_placeholder = st.empty()
@@ -2063,12 +2095,13 @@ def render_mapped_tables():
                     sid=st.session_state.get("current_sid", SID),
                     target_entity_spec=r["target_entity"],
                     import_mode=bulk_mode_label_to_val.get(bulk_mode, "upsert"),
-                    progress_cb=_cb
+                    progress_cb=_cb,
+                    sync_soft_delete=bulk_sync_soft_delete
                 )
             progress_placeholder.empty()
             st.success(f"✅ 完成入库（{bulk_mode}），总计写入 {total} 条。")
     with c2:
-        if st.button("一键删除（全部）"):
+        if st.button("一键删除（全部）", disabled=locked):
             total_del = 0
             for r in rows:
                 total_del += delete_table_data(r["target_entity"], sid=st.session_state.get("current_sid", SID)) 
@@ -2121,6 +2154,7 @@ def render_mapped_tables():
                 index=0,
                 key=f"mode_{src}_{tgt}"
             )
+            row_sync_soft_delete = st.checkbox("同步清理", value=False, key=f"sync_{src}_{tgt}")
             b1, b2 = st.columns([1,1])
             with b1:
                 if st.button("入库", key=f"imp_{src}_{tgt}"):
@@ -2150,13 +2184,14 @@ def render_mapped_tables():
                         sid=st.session_state.get("current_sid", SID),
                         target_entity_spec=tgt,
                         import_mode=mode_label_to_val.get(row_mode_label, "upsert"),
-                        progress_cb=_cb
+                        progress_cb=_cb,
+                        sync_soft_delete=row_sync_soft_delete
                     )
                     progress_placeholder.empty()
                     st.success(f"入库完成（{row_mode_label}）：写入 {n} 条")
                     st.rerun()
             with b2:
-                if st.button("删除", key=f"del_{src}_{tgt}"):
+                if st.button("删除", key=f"del_{src}_{tgt}", disabled=locked):
                     n = delete_table_data(tgt, sid=st.session_state.get("current_sid", SID))
                     st.success(f"删除完成：清理 {n} 条")
                     st.rerun()
@@ -4769,6 +4804,74 @@ def render_file_mgmt():
                 st.rerun()
             else:
                 st.info("未找到配置")
+
+    st.subheader("🧹 按 doc_type 批量删除")
+    doc_type_del = st.text_input("doc_type", key="file_doc_type_del2")
+    cols_doc = st.columns([1,1])
+    with cols_doc[0]:
+        btn_doc_preview = st.button("预览数量", key="file_doc_type_preview")
+    with cols_doc[1]:
+        btn_doc_delete = st.button("按 doc_type 删除", key="file_doc_type_del_btn2")
+    if btn_doc_preview:
+        dtv = str(doc_type_del or "").strip()
+        if not dtv:
+            st.warning("请输入 doc_type")
+        else:
+            from backend.sql_utils import get_conn
+            conn = get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(1) FROM file WHERE doc_type=%s", (dtv,))
+                    row = cur.fetchone()
+                    cnt = int(row[0] if row else 0)
+                st.info(f"可删除 file {cnt} 条")
+            except Exception as e:
+                st.error(f"预览失败：{e}")
+            finally:
+                conn.close()
+    if btn_doc_delete:
+        dtv = str(doc_type_del or "").strip()
+        if not dtv:
+            st.warning("请输入 doc_type")
+        else:
+            from backend.sql_utils import get_conn
+            import shutil
+            from pathlib import Path
+            conn = get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT uuid,file FROM file WHERE doc_type=%s", (dtv,))
+                    rows = cur.fetchall() or []
+                    paths = []
+                    for r in rows:
+                        try:
+                            rel = str(r[1] or "")
+                            parts = rel.split("/")
+                            if len(parts) >= 7 and parts[0] == ".." and parts[1] == "upload" and parts[2] == "files":
+                                sid_v = parts[3]
+                                yyyymm_v = parts[4]
+                                fdir = parts[5]
+                                base = Path(_get_upload_root()) / sid_v / yyyymm_v / fdir
+                                paths.append(base)
+                            elif len(parts) >= 5 and parts[1] == "upload":
+                                sid_v = parts[2]
+                                fuid_v = parts[3]
+                                base = Path(_get_upload_root()).parent / sid_v / fuid_v
+                                paths.append(base)
+                        except Exception:
+                            continue
+                    for p in paths:
+                        try:
+                            shutil.rmtree(p, ignore_errors=True)
+                        except Exception:
+                            pass
+                    cur.execute("DELETE FROM file WHERE doc_type=%s", (dtv,))
+                conn.commit()
+                st.success(f"已删除 doc_type={dtv} 的 file {len(rows)} 条，并清理本地目录 {len(paths)} 个")
+            except Exception as e:
+                conn.rollback(); st.error(f"删除失败：{e}")
+            finally:
+                conn.close()
 
 
 def render_user_dept_mgmt():

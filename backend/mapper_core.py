@@ -241,6 +241,9 @@ def _eval_entity_join(expr: str, record: Dict[str, Any]) -> Optional[Any]:
         )
 
     # 2) 否则按原先逻辑：从 record 里取右值（支持 record.xxx 或 a.b.c 链）
+    if source_expr.startswith("record."):
+        source_expr = source_expr[7:]
+    
     parts = source_expr.split(".")
     v = record
     for seg in parts:
@@ -434,6 +437,7 @@ def _eval_atom(atom: str, record: Dict[str, Any]) -> Any:
         # ✅ None 或空字符串都算“没命中”
         if v not in (None, "null", "NULL"):
             return v
+        return ""
     if a in record:
         return record.get(a)
     return a
@@ -598,6 +602,7 @@ def _eval_rule(rule: str, record: Dict[str, Any]) -> Any:
                 "__date_ts__": __date_ts__,
                 # 提供 SQL 查找辅助：单值与逗号分隔列表
                 "__sql_lookup__": _sql_lookup,
+                "__entity__": _entity_fetch,
                 "__sql_list__": lambda tbl, wf, csv_vals, tf: 
                     ",".join([
                         str(_sql_lookup(tbl, wf, v.strip(), tf) or v.strip())
@@ -719,6 +724,50 @@ INSERT_RE = re.compile(
     re.IGNORECASE
 )
 
+INSERT_PREFIX_RE = re.compile(
+    r"insert\s+into\s+public\.\"?(?P<table>[\w\u4e00-\u9fa5]+)\"?\s*\((?P<cols>[^)]*)\)\s*values\s*\(",
+    re.IGNORECASE
+)
+
+def _find_closing_paren(text: str, start: int) -> int:
+    """
+    从 text[start] 开始扫描，寻找匹配的 closing paren ')'。
+    start 应该是 '(' 之后的第一个字符的索引。
+    该函数会跳过单引号/双引号内的内容。
+    返回 ')' 的索引；如果没找到返回 -1。
+    """
+    depth = 1
+    in_quote = False
+    quote_char = None
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_quote:
+            if ch == quote_char:
+                # 检查转义: ' 后面跟 '
+                if quote_char == "'" and i + 1 < n and text[i+1] == "'":
+                    i += 2
+                    continue
+                in_quote = False
+            i += 1
+        else:
+            if ch == "'" or ch == '"':
+                in_quote = True
+                quote_char = ch
+                i += 1
+            elif ch == '(':
+                depth += 1
+                i += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+                i += 1
+            else:
+                i += 1
+    return -1
+
 def _safe_read_sql(file: Path) -> str:
     for enc in ("utf-8", "gbk", "utf-8-sig"):
         try:
@@ -760,15 +809,162 @@ def _parse_sql_file(sql_path: Path) -> List[Dict[str, Any]]:
     """返回所有 INSERT 记录组成的 dict 列表"""
     txt = _safe_read_sql(sql_path)
     entities = []
-    for m in INSERT_RE.finditer(txt):
-        cols = [c.strip().strip('"') for c in m.group("cols").split(",")]
-        vals = _parse_values(m.group("vals"))
-        if len(cols) != len(vals):
+    
+    # 使用 state machine 解析，避免 values 内部包含 ); 导致正则截断
+    pos = 0
+    while True:
+        m = INSERT_PREFIX_RE.search(txt, pos)
+        if not m:
+            break
+            
+        # m.end() 是 "VALUES (" 之后的第一个字符
+        start_vals = m.end()
+        end_vals = _find_closing_paren(txt, start_vals)
+        if end_vals == -1:
+            # 解析失败，可能是格式不对，跳过
+            pos = m.end()
             continue
-        entities.append(dict(zip(cols, vals)))
+            
+        cols_str = m.group("cols")
+        vals_str = txt[start_vals:end_vals]
+        
+        cols = [c.strip().strip('"') for c in cols_str.split(",")]
+        vals = _parse_values(vals_str)
+        
+        if len(cols) == len(vals):
+            entities.append(dict(zip(cols, vals)))
+            
+        # 移动 pos 到当前 INSERT 语句之后
+        # end_vals 指向 ')'，后面应该是 ';'
+        pos = end_vals + 1
+        
     return entities
 
-def query_source_sql(sql: str, main_table: str = "") -> List[Dict[str, Any]]:
+def _split_sql_params_header(sql: str) -> Tuple[str, Dict[str, Any]]:
+    s = sql or ""
+    lines = s.splitlines()
+    if not lines:
+        return s, {}
+    header_idx = None
+    header_match = None
+    for idx, ln in enumerate(lines):
+        if not ln.strip():
+            continue
+        m = re.fullmatch(r"--\s*params\s*:\s*(\{.*\})\s*", ln.strip(), flags=re.I)
+        if m:
+            header_idx = idx
+            header_match = m
+        break
+    if header_idx is None or header_match is None:
+        return s, {}
+    try:
+        params = json.loads(header_match.group(1))
+    except Exception:
+        params = {}
+    body = "\n".join(lines[header_idx + 1:]).lstrip("\n")
+    if not isinstance(params, dict):
+        params = {}
+    return body, params
+
+def _rewrite_record_tokens_to_named_params(sql: str, record: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    s = sql or ""
+    out = []
+    params: Dict[str, Any] = {}
+    i = 0
+    in_sq = False
+    in_dq = False
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            out.append(ch)
+            i += 1
+            continue
+        if in_sq or in_dq:
+            out.append(ch)
+            i += 1
+            continue
+        if s.startswith("record.", i):
+            j = i + 7
+            k = j
+            while k < len(s) and (s[k].isalnum() or s[k] == "_"):
+                k += 1
+            field = s[j:k]
+            if field:
+                pname = f"record_{field}"
+                out.append(f":{pname}")
+                if pname not in params:
+                    params[pname] = record.get(field)
+                i = k
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out), params
+
+def _resolve_sql_params(params: Dict[str, Any], record: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if not params:
+        return {}, None
+    out: Dict[str, Any] = {}
+    for k, v in params.items():
+        if isinstance(v, str) and v.startswith("record."):
+            if record is None:
+                return None, "SQL 参数引用了 record.xxx，但当前执行没有提供 record 上下文"
+            out[k] = record.get(v[7:])
+        else:
+            out[k] = v
+    return out, None
+
+def substitute_record_in_sql(sql: str, record: Dict[str, Any]) -> str:
+    def _lit(v: Any) -> str:
+        if v is None:
+            return "NULL"
+        if isinstance(v, (int, float)):
+            return str(v)
+        s = str(v)
+        s = s.replace("'", "''")
+        return f"'{s}'"
+
+    s = sql or ""
+    out = []
+    i = 0
+    in_sq = False
+    in_dq = False
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            out.append(ch)
+            i += 1
+            continue
+        if in_sq or in_dq:
+            out.append(ch)
+            i += 1
+            continue
+        if s.startswith("record.", i):
+            j = i + 7
+            k = j
+            while k < len(s) and (s[k].isalnum() or s[k] == "_"):
+                k += 1
+            field = s[j:k]
+            if field:
+                out.append(_lit(record.get(field)))
+                i = k
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+def query_source_sql(sql: str, main_table: str = "", parameters: Optional[Dict[str, Any]] = None, record: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
     在内存 SQLite 中执行针对源文件的 SQL 查询。
     支持跨表 JOIN (自动检测 SQL 中的表名并加载 source/sql/*.sql)。
@@ -776,6 +972,26 @@ def query_source_sql(sql: str, main_table: str = "") -> List[Dict[str, Any]]:
     import sqlite3
     import re
     
+    sql_body, header_params = _split_sql_params_header(sql)
+    header_params, header_err = _resolve_sql_params(header_params, record)
+    if header_err:
+        return [{"error": header_err}]
+
+    sql_exec = sql_body
+    record_params: Dict[str, Any] = {}
+    if "record." in sql_exec:
+        if record is None:
+            return [{"error": "SQL 中包含 record.xxx，但当前执行没有提供 record 上下文"}]
+        sql_exec, record_params = _rewrite_record_tokens_to_named_params(sql_exec, record)
+
+    merged_params: Dict[str, Any] = {}
+    if isinstance(parameters, dict):
+        merged_params.update(parameters)
+    if isinstance(record_params, dict):
+        merged_params.update(record_params)
+    if isinstance(header_params, dict):
+        merged_params.update(header_params)
+
     # 1. 识别涉及的表
     tables = set()
     if main_table:
@@ -784,7 +1000,7 @@ def query_source_sql(sql: str, main_table: str = "") -> List[Dict[str, Any]]:
     # 简单正则提取 FROM/JOIN 后的表名
     # 排除 SQL 关键字，但这只是粗略提取，多加载几个表无妨
     pattern = re.compile(r'\b(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)', re.IGNORECASE)
-    for t in pattern.findall(sql):
+    for t in pattern.findall(sql_exec):
         if t.lower() not in ("select", "where", "group", "order", "limit", "left", "right", "inner", "outer", "on", "as"):
             tables.add(t)
             
@@ -839,7 +1055,10 @@ def query_source_sql(sql: str, main_table: str = "") -> List[Dict[str, Any]]:
         conn.commit()
         
         # 3. 执行查询
-        cur.execute(sql)
+        if merged_params:
+            cur.execute(sql_exec, merged_params)
+        else:
+            cur.execute(sql_exec)
         desc = cur.description
         if not desc:
             return []
@@ -1004,10 +1223,10 @@ def _upsert_entity_row(type_name: str, key_field: str, key_value: Any,
             # 查询是否已存在该唯一键
             sel_sql = f"""
                 SELECT uuid, name, data FROM entity
-                WHERE type=%s AND {json_equals_clause('data', key_field)}
+                WHERE type=%s AND sid=%s AND {json_equals_clause('data', key_field)}
                 LIMIT 1
             """
-            cur.execute(sel_sql, (type_name, str(key_value)))
+            cur.execute(sel_sql, (type_name, sid, str(key_value)))
             row = cur.fetchone()
 
             if row:  # 命中
@@ -1087,9 +1306,9 @@ def upsert_entity(type_name: str, key_field: str, key_value: Any, name: str, dat
             # 1) 查是否已存在同一 fund
             sql_sel = f"""
                 SELECT uuid FROM entity
-                WHERE type=%s AND {json_equals_clause('data', key_field)} LIMIT 1
+                WHERE type=%s AND sid=%s AND {json_equals_clause('data', key_field)} LIMIT 1
             """
-            cur.execute(sql_sel, (type_name, str(key_value)))
+            cur.execute(sql_sel, (type_name, SID, str(key_value)))
             row = cur.fetchone()
 
             now_ts = int(time.time())
@@ -1170,7 +1389,7 @@ def check_entity_status(type_name: str, sid: Optional[str] = None) -> int:
     finally:
         conn.close()
 
-def import_table_data(source_table: str, sid: str = None, target_entity_spec: Optional[str] = None, import_mode: str = "upsert", progress_cb: Optional[Callable[[int, int], None]] = None) -> int:
+def import_table_data(source_table: str, sid: str = None, target_entity_spec: Optional[str] = None, import_mode: str = "upsert", progress_cb: Optional[Callable[[int, int], None]] = None, sync_soft_delete: bool = False) -> int:
     """
     读取 source/sql/<table>.sql 的所有 INSERT，映射后按 (type(key)) 规则 UPSERT 入库。
     - target_entity 支持 'fund' 或 'fund(id)'；后者表示统一主键是 data.id。
@@ -1219,6 +1438,7 @@ def import_table_data(source_table: str, sid: str = None, target_entity_spec: Op
     # 使用单个连接进行批量处理，避免频繁握手导致 OperationalError
     conn = get_conn()
     try:
+        seen_keys_by_type: Dict[str, set] = {}
         for idx, rec in enumerate(records, start=1):
             # 1) 映射：按当前 final_type 过滤字段映射 & 脚本上下文
             mapped_data, out_name, type_override = apply_record_mapping(
@@ -1277,6 +1497,11 @@ def import_table_data(source_table: str, sid: str = None, target_entity_spec: Op
                 import_mode=import_mode,
                 conn=conn
             )
+            try:
+                if key_val not in (None, ""):
+                    seen_keys_by_type.setdefault(type_here, set()).add(str(key_val))
+            except Exception:
+                pass
             # 9) 进度回调（每处理一条记录）
             try:
                 if progress_cb:
@@ -1287,6 +1512,19 @@ def import_table_data(source_table: str, sid: str = None, target_entity_spec: Op
             except Exception:
                 # 回调失败不影响主流程
                 pass
+        try:
+            if sync_soft_delete:
+                for tname, keep_keys in (seen_keys_by_type or {}).items():
+                    _sync_soft_delete_entities(
+                        conn=conn,
+                        sid=sid,
+                        type_name=tname,
+                        key_field=key_field,
+                        keep_keys=keep_keys,
+                        now_ts=now_ts
+                    )
+        except Exception as e:
+            print("[import_table_data sync_soft_delete error]", e)
     finally:
         try:
             conn.close()
@@ -1294,6 +1532,53 @@ def import_table_data(source_table: str, sid: str = None, target_entity_spec: Op
             pass
 
     return wrote
+
+def _sync_soft_delete_entities(conn, sid: str, type_name: str, key_field: str, keep_keys: set, now_ts: int) -> int:
+    if not conn or not sid or not type_name or not key_field:
+        return 0
+    keep_keys = keep_keys or set()
+    try:
+        with conn.cursor() as cur:
+            if is_pg():
+                kexpr = f"data->>'{key_field}'"
+            else:
+                kexpr = f"JSON_UNQUOTE(JSON_EXTRACT(data, '$.{key_field}'))"
+            cur.execute(
+                f"SELECT uuid, {kexpr} FROM entity WHERE type=%s AND sid=%s",
+                (type_name, sid)
+            )
+            rows = cur.fetchall() or []
+            keep_uuids = []
+            drop_uuids = []
+            for uuid, kval in rows:
+                if not kval:
+                    continue
+                if str(kval) in keep_keys:
+                    keep_uuids.append(uuid)
+                else:
+                    drop_uuids.append(uuid)
+
+            def _chunks(xs, n=400):
+                for i in range(0, len(xs), n):
+                    yield xs[i:i + n]
+
+            touched = 0
+            for ch in _chunks(drop_uuids):
+                ph = ",".join(["%s"] * len(ch))
+                cur.execute(
+                    f"UPDATE entity SET del=1, update_date=%s WHERE type=%s AND sid=%s AND uuid IN ({ph})",
+                    (int(now_ts), type_name, sid, *ch)
+                )
+                touched += cur.rowcount
+        conn.commit()
+        return touched
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print("[_sync_soft_delete_entities error]", e)
+        return 0
 
 def delete_table_data(type_name: str, sid: Optional[str] = None) -> int:
     """从 entity 物理删除该 type（按当前 sid 限制）"""
@@ -1324,4 +1609,3 @@ def get_all_prioritized_tables() -> List[str]:
 
 def get_table_priority(source_table: str) -> int:
     return get_priority(source_table)
-

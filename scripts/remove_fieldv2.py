@@ -292,9 +292,25 @@ def process_insert_statement(stmt: str, target_sid: str, mode: str = 'insert') -
             for col, norm, val in new_pairs:
                 if norm == 'uuid':
                     continue
-                set_clauses.append(f"{col} = EXCLUDED.{col}")
-            upsert_clause = f"ON CONFLICT({uuid_pair[0]}) DO UPDATE SET {', '.join(set_clauses)}"
-            return f"{new_stmt} {upsert_clause};"
+                set_clauses.append(f"{col} = {val}")
+            
+            out_cols = ', '.join([p[0] for p in new_pairs])
+            out_vals = ', '.join([p[2] for p in new_pairs])
+            uuid_val = uuid_pair[2]
+
+            # 生成 PL/pgSQL 匿名块：先判断是否存在，存在则 UPDATE，不存在则 INSERT
+            # 这种方式不依赖 unique constraint，更加灵活
+            block = (
+                f"DO $$\n"
+                f"BEGIN\n"
+                f"    IF EXISTS (SELECT 1 FROM entity WHERE uuid = {uuid_val}) THEN\n"
+                f"        UPDATE entity SET {', '.join(set_clauses)} WHERE uuid = {uuid_val};\n"
+                f"    ELSE\n"
+                f"        INSERT INTO entity ({out_cols}) VALUES ({out_vals});\n"
+                f"    END IF;\n"
+                f"END $$;"
+            )
+            return block
 
     return new_stmt + stmt_tail
 
@@ -355,7 +371,7 @@ def process_file(in_path: str, out_path: str, target_sid: str, mode: str = 'inse
 def main():
     base = os.path.dirname(os.path.abspath(__file__))
     in_path = os.path.join(base, 'entity.sql')
-    out_path = os.path.join(base, 'entity_processed.sql')
+    out_path = os.path.join(base, 'entity_processed_3_20_insert.sql')
     
     # 在这里配置目标 SID
     # target_sid = "'sahgqakmzd'"
@@ -366,7 +382,7 @@ def main():
     # 'insert': Standard INSERT
     # 'update': UPDATE entity SET ... WHERE uuid=... (only if uuid exists)
     # 'upsert': INSERT ... ON CONFLICT(uuid) DO UPDATE SET ... (Postgres style)
-    mode = 'update'
+    mode = 'insert'
     
     if not os.path.exists(in_path):
         raise FileNotFoundError(f'Input file not found: {in_path}')
