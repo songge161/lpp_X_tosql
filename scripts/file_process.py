@@ -174,13 +174,15 @@ def force_cleanup(stmt: str):
         return None
 
 
-def process_insert_statement(stmt: str, target_sid: str, mode: str = 'insert', fix: bool = False) -> str:
+def process_insert_statement(stmt: str, target_sid: str, mode: str = 'insert', fix: bool = False, fix2: bool = False) -> str:
     """Process one INSERT statement for table 'file':
     - Set sid to target_sid
     - Set privilege to NULL
     - Unify table name to file
     - mode='update': If uuid exists, convert to UPDATE statement
     - mode='upsert': If uuid exists, convert to INSERT ... ON CONFLICT(uuid) DO UPDATE ...
+    - fix=True: apply value fixes and swap type/doc_type
+    - fix2=True: apply value fixes but keep type/doc_type as-is
     """
     if 'INSERT' not in stmt.upper():
         return stmt
@@ -229,16 +231,17 @@ def process_insert_statement(stmt: str, target_sid: str, mode: str = 'insert', f
             if priv_idx < len(vals_mut):
                 vals_mut[priv_idx] = 'NULL'
         
-        # Swap logic for mismatch block
-        for idx, nm in enumerate(norm_mut):
-            if nm == 'doc_type':
-                 if cols_mut[idx].startswith('`'): cols_mut[idx] = '`type`'
-                 elif cols_mut[idx].startswith('"'): cols_mut[idx] = '"type"'
-                 else: cols_mut[idx] = 'type'
-            elif nm == 'type':
-                 if cols_mut[idx].startswith('`'): cols_mut[idx] = '`doc_type`'
-                 elif cols_mut[idx].startswith('"'): cols_mut[idx] = '"doc_type"'
-                 else: cols_mut[idx] = 'doc_type'
+        # Swap logic for mismatch block. fix2 keeps the original type/doc_type mapping.
+        if not fix2:
+            for idx, nm in enumerate(norm_mut):
+                if nm == 'doc_type':
+                     if cols_mut[idx].startswith('`'): cols_mut[idx] = '`type`'
+                     elif cols_mut[idx].startswith('"'): cols_mut[idx] = '"type"'
+                     else: cols_mut[idx] = 'type'
+                elif nm == 'type':
+                     if cols_mut[idx].startswith('`'): cols_mut[idx] = '`doc_type`'
+                     elif cols_mut[idx].startswith('"'): cols_mut[idx] = '"doc_type"'
+                     else: cols_mut[idx] = 'doc_type'
 
         pair_len = min(len(cols_mut), len(vals_mut))
         if pair_len > 0:
@@ -261,18 +264,19 @@ def process_insert_statement(stmt: str, target_sid: str, mode: str = 'insert', f
         elif n_c == 'privilege':
             final_val = 'NULL'
         
-        if n_c == 'doc_type':
-            if final_col.startswith('`'): final_col = '`type`'
-            elif final_col.startswith('"'): final_col = '"type"'
-            else: final_col = 'type'
-        elif n_c == 'type':
-            if final_col.startswith('`'): final_col = '`doc_type`'
-            elif final_col.startswith('"'): final_col = '"doc_type"'
-            else: final_col = 'doc_type'
+        if not fix2:
+            if n_c == 'doc_type':
+                if final_col.startswith('`'): final_col = '`type`'
+                elif final_col.startswith('"'): final_col = '"type"'
+                else: final_col = 'type'
+            elif n_c == 'type':
+                if final_col.startswith('`'): final_col = '`doc_type`'
+                elif final_col.startswith('"'): final_col = '"doc_type"'
+                else: final_col = 'doc_type'
             
         new_pairs.append((final_col, n_c, final_val))
 
-    if fix:
+    if fix or fix2:
         def _unq(v: str) -> str:
             s = v.strip()
             if len(s) >= 2 and s[0] == "'" and s[-1] == "'":
@@ -298,7 +302,7 @@ def process_insert_statement(stmt: str, target_sid: str, mode: str = 'insert', f
             return v
         ext = None
         for col, norm, val in new_pairs:
-            # 使用“交换后的”列名：即最终写入的 doc_type 列的值作为扩展名
+            # fix 时使用交换后的列名，fix2 时保持原始列名。
             if strip_ident_quotes(col).lower() == 'doc_type':
                 ext = _unq(val)
                 break
@@ -352,7 +356,7 @@ def process_insert_statement(stmt: str, target_sid: str, mode: str = 'insert', f
     return new_stmt + stmt_tail
 
 
-def process_file(in_path: str, out_path: str, target_sid: str, mode: str = 'insert', fix: bool = False):
+def process_file(in_path: str, out_path: str, target_sid: str, mode: str = 'insert', fix: bool = False, fix2: bool = False):
     with open(in_path, 'r', encoding='utf-8') as f:
         src = f.read()
 
@@ -369,11 +373,11 @@ def process_file(in_path: str, out_path: str, target_sid: str, mode: str = 'inse
         end = find_stmt_end(src, start)
         if end < 0:
             stmt = src[start:]
-            new_stmt = process_insert_statement(stmt, target_sid, mode, fix=fix)
+            new_stmt = process_insert_statement(stmt, target_sid, mode, fix=fix, fix2=fix2)
             out_parts.append(new_stmt)
             break
         stmt = src[start:end]
-        new_stmt = process_insert_statement(stmt, target_sid, mode, fix=fix)
+        new_stmt = process_insert_statement(stmt, target_sid, mode, fix=fix, fix2=fix2)
         out_parts.append(new_stmt)
         i = end
 
@@ -392,7 +396,7 @@ def process_file(in_path: str, out_path: str, target_sid: str, mode: str = 'inse
 def main():
     base = os.path.dirname(os.path.abspath(__file__))
     in_path = os.path.join(base, 'file.sql')
-    out_path = os.path.join(base, 'file_processed_3_20_insert.sql')
+    out_path = os.path.join(base, 'file_processed_3_27_2_1_insert.sql')
     
     # target_sid = "'nadrebqvk1'"
     # The grep showed sid in file.sql is 'i6qzt3nn20'
@@ -407,13 +411,20 @@ def main():
     # 'update': UPDATE entity SET ... WHERE uuid=... (only if uuid exists)
     # 'upsert': INSERT ... ON CONFLICT(uuid) DO UPDATE SET ... (Postgres style)
     mode = 'insert'
-    fix = True
-    
+    fix = False
+    fix2 = True
+    #fix=False, fix2=False
+    #只做基础转换：改表名、改 sid、清 privilege，并且仍会交换 type/doc_type。
+    #fix=True, fix2=False
+    #保持原来的 fix 行为：基础转换 + 交换 type/doc_type + 补文件后缀 + 修时间戳。
+    #fix=False, fix2=True
+    #新增的 fix2 行为：基础转换 + 补文件后缀 + 修时间戳，但不交换 type/doc_type。
+
     if not os.path.exists(in_path):
         raise FileNotFoundError(f'Input file not found: {in_path}')
         
-    print(f"Processing '{in_path}' -> '{out_path}' with sid={target_sid}, mode={mode}...")
-    process_file(in_path, out_path, target_sid, mode, fix=fix)
+    print(f"Processing '{in_path}' -> '{out_path}' with sid={target_sid}, mode={mode}, fix={fix}, fix2={fix2}...")
+    process_file(in_path, out_path, target_sid, mode, fix=fix, fix2=fix2)
     print("Done.")
 
 

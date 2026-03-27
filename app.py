@@ -1,13 +1,14 @@
 # app.py
 # -*- coding: utf-8 -*-
+import streamlit as st
+st.set_page_config(layout="wide", page_title="PEPM 实体转换管理")
+
 import json
 import re
 from pathlib import Path
-import streamlit as st
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List
 
-# 顶部 import 部分
 from backend.db import (
     init_db, list_tables, list_mapped_tables, save_table_mapping, soft_delete_table,
     restore_table, get_target_entity, get_priority,
@@ -17,6 +18,8 @@ from backend.db import (
     rename_table_target_entity,
     list_table_targets,
     get_flow_entity_map, upsert_flow_entity_map, list_flow_entity_maps,
+    list_file_map_cfgs, upsert_file_map_cfg, delete_file_map_cfg_by_id, update_file_map_status,
+    list_doc_dir_cfgs, save_doc_dir_cfg, delete_doc_dir_cfg,
     get_app_setting, set_app_setting
 )
 from backend.source_fields import detect_source_fields, detect_sql_path,detect_field_comments, detect_table_title
@@ -43,7 +46,6 @@ except Exception:
         s = (s or "0") + "".join(chars[random.randint(0,35)] for _ in range(3))
         return s[-10:].rjust(10, "0")
 
-st.set_page_config(page_title="表映射管理工具", layout="wide")
 init_db()
 init_presets_db()
 
@@ -2352,7 +2354,7 @@ def render_flow_mgmt():
     st.title("🧰 流程管理")
     render_top_tabs('flow')
     super_tabs = st.tabs(["表单转换管理", "表单转换入库", "后台数据"])
-
+    
     with super_tabs[0]:
         st.subheader("表单转换管理")
         kw = st.text_input("关键词（实例ID/业务键/定义编码）", key="form_conv_kw")
@@ -3512,6 +3514,1102 @@ def render_flow_mgmt():
             else:
                 st.info("暂无匹配的实例。")
 
+
+
+def render_doc_dir_tab():
+    st.subheader("Java版本 - 文档归档配置")
+    st.info("用于配置文档归档目录结构、文件筛选与预览")
+
+    cfgs = list_doc_dir_cfgs()
+    cfg_options = {"(新增配置)": None}
+    for c in cfgs:
+        label = f"[{c.get('id')}] {c.get('name')} - {c.get('source_table')}->{c.get('target_entity')}"
+        cfg_options[label] = c
+    sel_key = st.selectbox("选择或新增归档配置", list(cfg_options.keys()))
+    sel_cfg = cfg_options[sel_key]
+
+    def _render_dir_template(tpl: str, row: Dict[str, Any]) -> str:
+        import datetime
+
+        def _val(k: str):
+            v = row.get(k, "")
+            if v is None:
+                return ""
+            return str(v)
+
+        def _parse_time(v: str):
+            s = str(v or "").strip()
+            if not s:
+                return None
+            try:
+                if s.isdigit():
+                    ts = int(s)
+                    if ts > 10**12:
+                        ts = int(ts / 1000)
+                    return datetime.datetime.fromtimestamp(ts)
+            except Exception:
+                pass
+            try:
+                return datetime.datetime.fromisoformat(s.replace("Z", ""))
+            except Exception:
+                return None
+
+        out = re.sub(r"sql\.([A-Za-z0-9_]+)", lambda m: _val(m.group(1)), tpl or "")
+
+        def _date_repl(m):
+            fmt = m.group(1).strip()
+            raw_arg = m.group(2).strip()
+            if raw_arg.startswith("sql."):
+                arg_val = _val(raw_arg[4:])
+            else:
+                arg_val = raw_arg.strip("'\"")
+            dt = _parse_time(arg_val)
+            if dt:
+                try:
+                    return dt.strftime(fmt)
+                except Exception:
+                    return arg_val
+            return arg_val
+
+        out = re.sub(r"date\(\s*([^,]+)\s*,\s*([^)]+)\)", _date_repl, out)
+        return out
+
+    def _split_files(raw: str):
+        parts = [p.strip() for p in str(raw or "").split(",") if p.strip()]
+        out = []
+        for p in parts:
+            name, url = (p.split("@", 1) + [""])[:2]
+            name = name.strip()
+            url = url.strip()
+            if not name and url:
+                name = url.rsplit("/", 1)[-1].strip()
+            out.append({"name": name or "unnamed", "url": url, "raw": p})
+        return out
+
+    def _extract_files(val: Any):
+        if val is None:
+            return []
+        if isinstance(val, str):
+            s = val.strip()
+            if s.startswith("[") or s.startswith("{"):
+                try:
+                    j = json.loads(s)
+                    return _extract_files(j)
+                except Exception:
+                    return _split_files(val)
+            return _split_files(val)
+        if isinstance(val, dict):
+            name = val.get("name") or val.get("filename") or val.get("title")
+            url = val.get("url") or val.get("file") or ""
+            return [{"name": name or "unnamed", "url": url, "raw": val, "uuid": val.get("uuid")}]
+        if isinstance(val, list):
+            items = []
+            for it in val:
+                if isinstance(it, dict):
+                    name = it.get("name") or it.get("filename") or it.get("title")
+                    url = it.get("url") or it.get("file") or ""
+                    items.append({"name": name or "unnamed", "url": url, "raw": it, "uuid": it.get("uuid")})
+                else:
+                    items.extend(_split_files(str(it)))
+            return items
+        return _split_files(str(val))
+
+    def _get_upload_root():
+        try:
+            v = st.session_state.get("upload_root")
+            if v:
+                return str(v).strip()
+        except Exception:
+            pass
+        try:
+            from pathlib import Path
+            txt = Path("outer_packet/config_data.json").read_text(encoding="utf-8")
+            cfg = json.loads(txt) if txt else {}
+            if isinstance(cfg, dict):
+                v = cfg.get("upload_root") or ""
+                if v:
+                    return str(v).strip()
+        except Exception:
+            pass
+        return "/Users/songyihong/PEPM/lpp/upload/files"
+
+    def _resolve_source_file(src_url: str):
+        try:
+            from pathlib import Path
+            url = str(src_url or "").strip()
+            if url.startswith("`") and url.endswith("`"):
+                url = url[1:-1].strip()
+            url = url.strip()
+            if not url:
+                return None
+            if url.startswith("/upload/"):
+                rel = url[len("/upload/"):]
+                p = Path("/Users/songyihong/PEPM/lpp/upload") / rel
+                return p if p.exists() else p
+            base = Path("/Users/songyihong/PycharmProjects/FastAPIProject/source/files/caitou")
+            candidates = []
+            if "defaultFile/" in url:
+                rel = url.split("defaultFile/", 1)[1].strip("/")
+                candidates.append(base / "defaultFile" / rel)
+                parts = rel.split("/")
+                if len(parts) >= 3:
+                    h = parts[1]
+                    fname = parts[-1]
+                    candidates.append(base / h / fname)
+                    if "." in fname:
+                        candidates.append(base / f"{h}.{fname.rsplit('.', 1)[1]}")
+            else:
+                rel = url.strip("/")
+                candidates.append(base / rel)
+            for p in candidates:
+                if p.exists():
+                    return p
+            return candidates[0] if candidates else None
+        except Exception:
+            return None
+
+    def _copy_source_file(src_url: str, sid_val: str, fuid: str) -> int:
+        try:
+            import shutil
+            from pathlib import Path
+            url = str(src_url or "").strip()
+            if url.startswith("`") and url.endswith("`"):
+                url = url[1:-1].strip()
+            url = url.strip()
+            if not url:
+                return 0
+            target_dir = Path("/Users/songyihong/PEPM/lpp/upload") / sid_val / fuid
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_path = target_dir / fuid
+            if url.startswith("/upload/"):
+                src_path = _resolve_source_file(url)
+                if src_path.exists():
+                    shutil.copy2(src_path, target_path)
+                    return int(target_path.stat().st_size)
+                return 0
+            if "defaultFile/" in url:
+                rel = url.split("defaultFile/", 1)[1].strip("/")
+            else:
+                rel = url.strip("/")
+            src_path = Path("/Users/songyihong/PycharmProjects/FastAPIProject/source/files/caitou") / rel
+            if src_path.exists():
+                shutil.copy2(src_path, target_path)
+                return int(target_path.stat().st_size)
+            try:
+                from urllib.request import urlopen
+                if url.startswith("http://") or url.startswith("https://"):
+                    with urlopen(url) as resp, open(target_path, "wb") as f:
+                        f.write(resp.read())
+                    return int(target_path.stat().st_size)
+                return 0
+            except Exception:
+                return 0
+        except Exception:
+            return 0
+
+    def _parse_file_meta(it: Dict[str, Any]):
+        name = str(it.get("name",""))
+        url = str(it.get("url",""))
+        ext = ""
+        if "." in name:
+            ext = name.rsplit(".", 1)[1]
+        elif url and "." in url.rsplit("/", 1)[-1]:
+            ext = url.rsplit("/", 1)[-1].rsplit(".", 1)[-1]
+        m = re.search(r"/defaultFile/(\d{8})/([^/]+)/", url)
+        ymd = (m.group(1) if m else "")
+        token = (m.group(2) if m else "")
+        return {
+            "name": name,
+            "url": url,
+            "ext": ext,
+            "yyyymmdd": ymd,
+            "token": token
+        }
+
+    def _infra_match_row(it: Dict[str, Any]):
+        meta = _parse_file_meta(it)
+        try:
+            rows = _read_sql_rows("infra_file")
+        except Exception:
+            rows = []
+        full_name = str(meta.get("name",""))
+        url = str(meta.get("url",""))
+        ymd = str(meta.get("yyyymmdd",""))
+        token = str(meta.get("token",""))
+        r = next((x for x in rows if str(x.get("url","")) == url), None)
+        if r:
+            return r
+        if ymd:
+            if token:
+                r = next((x for x in rows if str(x.get("name","")) == full_name and str(x.get("path","")) .startswith(f"defaultFile/{ymd}/") and token in str(x.get("path",""))), None)
+                if r:
+                    return r
+            r = next((x for x in rows if str(x.get("name","")) == full_name and str(x.get("path","")) .startswith(f"defaultFile/{ymd}/")), None)
+            if r:
+                return r
+        r = next((x for x in rows if str(x.get("name","")) == full_name), None)
+        return r or {}
+
+    def _usr_uuid_by_source_id(src_id: str):
+        from backend.sql_utils import get_conn, json_equals_clause
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT uuid FROM usr WHERE {json_equals_clause('data','source_id')} LIMIT 1",
+                    (str(src_id or ""),)
+                )
+                row = cur.fetchone()
+                return (row[0] if row else None)
+        except Exception:
+            return None
+        finally:
+            conn.close()
+
+    def _infer_file_people(it: Dict[str, Any]):
+        infra = _infra_match_row(it)
+        c_uuid = None
+        u_uuid = None
+        usr_update_epoch = None
+        if infra:
+            c_uuid = _usr_uuid_by_source_id(infra.get("creator"))
+            u_uuid = _usr_uuid_by_source_id(infra.get("updater"))
+            ts = str(infra.get("update_time") or "")
+            try:
+                from datetime import datetime
+                usr_update_epoch = int(datetime.strptime(ts.split(".")[0], "%Y-%m-%d %H:%M:%S").timestamp())
+            except Exception:
+                usr_update_epoch = None
+        return c_uuid, u_uuid, usr_update_epoch
+
+    def _fetch_record(table_name: str, rec_id: str):
+        rec_id = str(rec_id or "").strip()
+        if not rec_id:
+            return None
+        if st.session_state.get("source_input_kind") == "db":
+            try:
+                from backend.sql_utils import get_source_conn
+                conn = get_source_conn()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(f"SELECT * FROM {table_name} WHERE id=%s LIMIT 1", (rec_id,))
+                        row = cur.fetchone()
+                        cols = [d[0] for d in (cur.description or [])]
+                    if not row:
+                        return None
+                    if isinstance(row, dict):
+                        return row
+                    if cols:
+                        return dict(zip(cols, row))
+                    return {f"col_{i}": v for i, v in enumerate(row)}
+                finally:
+                    conn.close()
+            except Exception:
+                return None
+        rows = _parse_all_inserts(table_name)
+        for r in rows or []:
+            if str(r.get("id", "")) == rec_id or str(r.get("uuid", "")) == rec_id:
+                return r
+        return None
+
+    def _read_entity_rows(entity_type: str):
+        from backend.sql_utils import get_conn
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT uuid,data FROM entity WHERE type=%s", (entity_type,))
+                rows = cur.fetchall() or []
+            out = []
+            for r in rows:
+                uuid_val = r[0]
+                data = {}
+                if r[1]:
+                    try:
+                        data = json.loads(r[1])
+                    except Exception:
+                        data = {}
+                row = {"uuid": uuid_val}
+                if isinstance(data, dict):
+                    row.update(data)
+                out.append(row)
+            return out
+        except Exception:
+            return []
+        finally:
+            conn.close()
+
+    def _list_entity_types():
+        from backend.sql_utils import get_conn
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT type FROM entity ORDER BY type")
+                rows = cur.fetchall() or []
+            return [r[0] for r in rows if r and r[0]]
+        except Exception:
+            return []
+        finally:
+            conn.close()
+
+    def _read_custom_rows(table: str, filter_sql: str):
+        if st.session_state.get("source_input_kind") != "db":
+            try:
+                from backend.mapper_core import query_source_sql
+                sql = f"SELECT * FROM {table}"
+                if filter_sql:
+                    sql += f" WHERE {filter_sql}"
+                res = query_source_sql(sql, table)
+                if res and isinstance(res, list) and "error" in res[0]:
+                    st.error(f"SQL筛选错误：{res[0]['error']}")
+                    return []
+                return res or []
+            except Exception as e:
+                st.error(f"SQL文件读取失败：{e}")
+                return []
+        from backend.sql_utils import get_source_conn
+        conn = get_source_conn()
+        try:
+            with conn.cursor() as cur:
+                sql = f"SELECT * FROM {table}"
+                if filter_sql:
+                    sql += f" WHERE {filter_sql}"
+                cur.execute(sql)
+                fetched = cur.fetchall() or []
+                cols = [d[0] for d in (cur.description or [])]
+            if fetched and isinstance(fetched[0], dict):
+                return list(fetched)
+            if cols:
+                return [dict(zip(cols, row)) for row in fetched]
+            return []
+        except Exception as e:
+            st.error(f"源库查询失败：{e}")
+            return []
+        finally:
+            conn.close()
+
+    def _get_by_path(obj: Dict[str, Any], path: str):
+        parts = str(path or "").split(".")
+        cur = obj
+        for p in parts:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(p)
+        if parts and parts[0] == "data" and (cur is None or not isinstance(cur, dict)):
+            cur = obj
+            for p in parts[1:]:
+                if not isinstance(cur, dict):
+                    return None
+                cur = cur.get(p)
+            return cur
+        return cur
+
+    def _row_match_filter(row: Dict[str, Any], filter_sql: str) -> bool:
+        def _coerce_bool(v: Any):
+            s = str(v).strip().lower()
+            if s in ("是", "1", "true", "yes", "y"):
+                return True
+            if s in ("否", "0", "false", "no", "n"):
+                return False
+            return None
+        expr = str(filter_sql or "").strip()
+        if not expr:
+            return True
+        parts = re.split(r"\s+AND\s+", expr, flags=re.I)
+        for part in parts:
+            s = part.strip()
+            if not s:
+                continue
+            m = re.match(r"(.+?)\s+(NOT\s+IN|IN)\s*\((.+)\)\s*$", s, flags=re.I)
+            op = None
+            key = None
+            val = None
+            if m:
+                key, op, val = m.group(1).strip(), m.group(2).upper().replace(" ", ""), m.group(3).strip()
+            else:
+                m = re.match(r"(.+?)\s*(=|!=|<>)\s*(.+)", s)
+                if m:
+                    key, op, val = m.group(1).strip(), m.group(2), m.group(3).strip()
+                else:
+                    m = re.match(r"(.+?)\s+LIKE\s+(.+)", s, flags=re.I)
+                    if m:
+                        key, op, val = m.group(1).strip(), "LIKE", m.group(2).strip()
+            if not key:
+                return False
+            if val and ((val.startswith("'") and val.endswith("'")) or (val.startswith('"') and val.endswith('"'))):
+                val = val[1:-1]
+            rv = _get_by_path(row, key)
+            if rv is None and key.startswith("data."):
+                rv = _get_by_path(row, key.split("data.", 1)[1])
+            if op in ("IN", "NOTIN"):
+                items = [x.strip() for x in str(val or "").split(",") if x.strip()]
+                cleaned = []
+                for it in items:
+                    if (it.startswith("'") and it.endswith("'")) or (it.startswith('"') and it.endswith('"')):
+                        it = it[1:-1]
+                    cleaned.append(it)
+                hit = str(rv) in cleaned
+                if (op == "IN" and not hit) or (op == "NOTIN" and hit):
+                    return False
+            elif op == "LIKE":
+                pat = re.escape(str(val or "")).replace(r"\%", ".*").replace(r"\_", ".")
+                if rv is None or re.fullmatch(pat, str(rv)) is None:
+                    return False
+            elif op in ("=", "!=" , "<>"):
+                bv = _coerce_bool(val)
+                rvb = _coerce_bool(rv)
+                if (bv is not None) and (rvb is not None):
+                    if (rvb == bv) == (op in ("!=", "<>")):
+                        return False
+                else:
+                    if (str(rv) == str(val)) == (op in ("!=", "<>")):
+                        return False
+            else:
+                return False
+        return True
+
+    def _match_target_entity(ent_uuid: str, target_filter: str) -> bool:
+        val = str(target_filter or "").strip()
+        if not val:
+            return True
+        if any(x in val for x in ("data.", "=", "!=", "<>", "LIKE", "like", "AND", "and")):
+            ent_row = _fetch_entity_by_uuid(ent_uuid)
+            if not ent_row:
+                return False
+            return _row_match_filter(ent_row, val)
+        if "," in val:
+            allowed = [x.strip() for x in val.split(",") if x.strip()]
+            return str(ent_uuid or "") in allowed
+        return str(ent_uuid or "") == val
+
+    def _build_sql_file_id_conds(table: str, rec_id: str) -> str:
+        try:
+            from backend.source_fields import detect_source_fields
+            cols = set(detect_source_fields(table))
+        except Exception:
+            cols = set()
+        conds = []
+        if "id" in cols:
+            conds.append(f"id='{rec_id}'")
+        if "uuid" in cols:
+            conds.append(f"uuid='{rec_id}'")
+        return " OR ".join(conds)
+
+    def _fetch_sql_file_record(table: str, rec_id: str, filter_sql: str):
+        try:
+            from backend.mapper_core import query_source_sql
+            conds = _build_sql_file_id_conds(table, rec_id)
+            if not conds:
+                st.error("SQL文件中未找到 id/uuid 字段")
+                return None
+            sql = f"SELECT * FROM {table} WHERE ({conds})"
+            if filter_sql:
+                sql += f" AND ({filter_sql})"
+            res = query_source_sql(sql, table)
+            if res and isinstance(res, list) and "error" in res[0]:
+                st.error(f"SQL筛选错误：{res[0]['error']}")
+                return None
+            return res[0] if res else None
+        except Exception as e:
+            st.error(f"SQL文件读取失败：{e}")
+            return None
+
+    def _fetch_custom_record(table: str, rec_id: str, filter_sql: str):
+        if st.session_state.get("source_input_kind") != "db":
+            return _fetch_sql_file_record(table, rec_id, filter_sql)
+        from backend.sql_utils import get_source_conn
+        conn = get_source_conn()
+        try:
+            with conn.cursor() as cur:
+                sql = f"SELECT * FROM {table} WHERE (id=%s OR uuid=%s)"
+                params = [rec_id, rec_id]
+                if filter_sql:
+                    sql += f" AND ({filter_sql})"
+                cur.execute(sql, params)
+                row = cur.fetchone()
+                cols = [d[0] for d in (cur.description or [])]
+            if not row:
+                return None
+            if isinstance(row, dict):
+                return row
+            if cols:
+                return dict(zip(cols, row))
+            return None
+        except Exception as e:
+            st.error(f"源库查询失败：{e}")
+            return None
+        finally:
+            conn.close()
+
+    def _fetch_entity_record(entity_type: str, rec_id: str):
+        from backend.sql_utils import get_conn, json_equals_clause
+        rec_id = str(rec_id or "").strip()
+        if not rec_id:
+            return None
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT uuid,data FROM entity WHERE type=%s AND (uuid=%s OR {json_equals_clause('data', match_entity_field)}) LIMIT 1",
+                    (entity_type, rec_id, rec_id)
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                data = {}
+                if row[1]:
+                    try:
+                        data = json.loads(row[1])
+                    except Exception:
+                        data = {}
+                res = {"uuid": row[0]}
+                if isinstance(data, dict):
+                    res.update(data)
+                return res
+        except Exception:
+            return None
+        finally:
+            conn.close()
+
+    def _fetch_entity_by_uuid(ent_uuid: str):
+        from backend.sql_utils import get_conn
+        ent_uuid = str(ent_uuid or "").strip()
+        if not ent_uuid:
+            return None
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT uuid,data FROM entity WHERE uuid=%s LIMIT 1", (ent_uuid,))
+                row = cur.fetchone()
+            if not row:
+                return None
+            data = {}
+            if row[1]:
+                try:
+                    data = json.loads(row[1])
+                except Exception:
+                    data = {}
+            res = {"uuid": row[0]}
+            if isinstance(data, dict):
+                res.update(data)
+            return res
+        except Exception:
+            return None
+        finally:
+            conn.close()
+
+    def _normalize_dir_path(path: str) -> str:
+        s = str(path or "").replace("+", "").replace("'", "").replace('"', "")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _get_table_columns(table: str):
+        from backend.sql_utils import get_conn, is_pg
+        cols = []
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                if is_pg():
+                    cur.execute(
+                        """
+                        SELECT column_name FROM information_schema.columns
+                        WHERE table_name=%s
+                        ORDER BY ordinal_position
+                        """,
+                        (table,)
+                    )
+                    cols = [r[0] for r in cur.fetchall()]
+                else:
+                    cur.execute(f"SHOW COLUMNS FROM {table}")
+                    raw_cols = cur.fetchall()
+                    cols = []
+                    for r in raw_cols:
+                        name = r[0]
+                        extra = str(r[5] or "") if len(r) > 5 else ""
+                        if "GENERATED" in extra.upper():
+                            continue
+                        cols.append(name)
+        except Exception:
+            return []
+        finally:
+            conn.close()
+        return cols
+
+    def _insert_rows(table: str, rows: List[Dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        from backend.sql_utils import get_conn
+        cols = _get_table_columns(table)
+        if not cols:
+            st.error(f"未获取到 {table} 的字段信息")
+            return 0
+        keys = [c for c in cols if c in rows[0]]
+        if not keys:
+            st.error(f"{table} 无可写入字段匹配")
+            return 0
+        placeholders = ",".join(["%s"] * len(keys))
+        sql = f"INSERT INTO {table} ({','.join(keys)}) VALUES ({placeholders})"
+        data = [tuple(r.get(k) for k in keys) for r in rows]
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.executemany(sql, data)
+            conn.commit()
+            return len(rows)
+        except Exception as e:
+            conn.rollback()
+            st.error(f"{table} 写入失败：{e}")
+            return 0
+        finally:
+            conn.close()
+
+    def _find_entity_uuid(entity_type: str, match_field: str, match_value: Any):
+        from backend.sql_utils import get_conn, json_equals_clause
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT uuid FROM entity WHERE type=%s AND {json_equals_clause('data', match_field)} LIMIT 1",
+                    (entity_type, str(match_value))
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    return row[0]
+        except Exception:
+            return None
+        finally:
+            conn.close()
+        return None
+
+    def _build_archive_rows(rows: List[Dict[str, Any]], parent_uid: str, source_table: str, source_entity_type: str, do_copy: bool, write_search: bool = True, progress_cb=None):
+        sid_val = st.session_state.get("current_sid", SID)
+        folder_map: Dict[str, str] = {}
+        folder_file_rows = []
+        file_rows = []
+        search_rows = []
+        total = len(rows or [])
+        for idx, r in enumerate(rows or [], start=1):
+            if progress_cb:
+                try:
+                    progress_cb(idx, total)
+                except Exception:
+                    pass
+            if source_table == "entity":
+                if target_entity and source_entity_type and source_entity_type != target_entity:
+                    match_val = _get_by_path(r, sql_field)
+                    ent_uuid = _find_entity_uuid(target_entity, match_entity_field, match_val)
+                else:
+                    ent_uuid = r.get("uuid")
+            else:
+                match_val = _get_by_path(r, sql_field)
+                ent_uuid = _find_entity_uuid(target_entity, match_entity_field, match_val)
+            if not ent_uuid:
+                continue
+            if target_filter and not _match_target_entity(ent_uuid, target_filter):
+                continue
+            raw_dir = _render_dir_template(dir_template, r)
+            norm_dir = _normalize_dir_path(raw_dir)
+            parts = [p for p in norm_dir.split("/") if p.strip()]
+            cur_parent = parent_uid or "root"
+            path_acc = ""
+            for p in parts:
+                path_acc = f"{path_acc}/{p}" if path_acc else p
+                key = f"{cur_parent}:{path_acc}"
+                if key in folder_map:
+                    cur_parent = folder_map[key]
+                    continue
+                folder_uuid = gen_uuid10()
+                folder_map[key] = folder_uuid
+                folder_file_rows.append({
+                    "uuid": folder_uuid,
+                    "name": p,
+                    "file": "",
+                    "doc_type": "",
+                    "flag": "",
+                    "size": 0,
+                    "data": json.dumps({}, ensure_ascii=False),
+                    "path": json.dumps({}, ensure_ascii=False),
+                    "quote": json.dumps({}, ensure_ascii=False),
+                    "sid": sid_val,
+                    "eid": ent_uuid,
+                    "type": "dir",
+                    "uid": cur_parent,
+                    "create_people": "root",
+                    "create_date": int(time.time()),
+                    "update_people": "root",
+                    "update_date": int(time.time()),
+                    "del": 0,
+                    "state": 0,
+                    "filecrypt": 0,
+                    "oss": 0,
+                    "privilege": ""
+                })
+                if write_search:
+                    search_rows.append({
+                        "uuid": gen_uuid10(),
+                        "eid": ent_uuid,
+                        "url": None,
+                        "title": p,
+                        "content": f"\"{p}\"",
+                        "type": "file",
+                        "is_dir": 0,
+                        "file_data": json.dumps({"uuid": folder_uuid}, ensure_ascii=False),
+                        "sid": sid_val
+                    })
+                cur_parent = folder_uuid
+            files_raw = r.get(src_field, "")
+            if source_table == "entity":
+                items = _extract_files(files_raw)
+            else:
+                items = _split_files(files_raw)
+            if file_filter:
+                try:
+                    pat = re.compile(file_filter)
+                    items = [x for x in items if pat.search(x.get("name") or x.get("raw") or "")]
+                except Exception:
+                    pass
+            for it in items:
+                name = it.get("name") or "unnamed"
+                url = it.get("url") or ""
+                ext = _parse_file_meta(it).get("ext") or ""
+                fuid = gen_uuid10()
+                now_ts = int(time.time())
+                c_uuid, u_uuid, usr_update_epoch = _infer_file_people(it)
+                rel_url = f"/upload/{sid_val}/{fuid}/{fuid}"
+                size_val = 0
+                if do_copy:
+                    size_val = _copy_source_file(url, sid_val, fuid)
+                file_rows.append({
+                    "uuid": fuid,
+                    "name": name,
+                    "file": rel_url,
+                    "doc_type": ext,
+                    "flag": "",
+                    "size": size_val,
+                    "data": json.dumps({}, ensure_ascii=False),
+                    "path": json.dumps({}, ensure_ascii=False),
+                    "quote": json.dumps({}, ensure_ascii=False),
+                    "sid": sid_val,
+                    "eid": ent_uuid,
+                    "type": target_entity,
+                    "uid": cur_parent,
+                    "create_people": (c_uuid or "root"),
+                    "create_date": now_ts,
+                    "update_people": (u_uuid or "root"),
+                    "update_date": (usr_update_epoch or now_ts),
+                    "del": 0,
+                    "state": 0,
+                    "filecrypt": 0,
+                    "oss": 0,
+                    "privilege": ""
+                })
+                if write_search:
+                    search_rows.append({
+                        "uuid": gen_uuid10(),
+                        "eid": ent_uuid,
+                        "url": rel_url,
+                        "title": name,
+                        "content": f"\"{ext}\"",
+                        "type": "file",
+                        "is_dir": 0,
+                        "file_data": json.dumps({"uuid": fuid}, ensure_ascii=False),
+                        "sid": sid_val
+                    })
+        return folder_file_rows, file_rows, search_rows
+
+    mapped_rows = list_mapped_tables()
+    opts = []
+    for r in mapped_rows:
+        cnt = check_entity_status(r.get("target_entity",""), sid=st.session_state.get("current_sid", SID))
+        if cnt > 0:
+            opts.append({"src": r.get("source_table",""), "ent": r.get("target_entity",""), "cnt": cnt})
+    labels = [f"{o['src']} ({o['ent']},{o['cnt']})" for o in opts]
+    entity_types = _list_entity_types()
+    entity_labels = [f"entity:{t} (entity)" for t in entity_types]
+    custom_label = "自定义源表 (源库)"
+    labels = [custom_label] + entity_labels + labels
+    with st.form("doc_dir_form"):
+        cid = sel_cfg.get("id") if sel_cfg else None
+        col1, col2 = st.columns(2)
+        with col1:
+            name_val = st.text_input("配置名称", value=sel_cfg.get("name") if sel_cfg else "")
+            default_src = sel_cfg.get("source_table") if sel_cfg else ""
+            if labels:
+                try:
+                    if default_src.startswith("custom:"):
+                        idx = labels.index(custom_label)
+                    elif default_src.startswith("entity:"):
+                        idx = labels.index(f"{default_src} (entity)")
+                    elif default_src:
+                        idx = next(i for i, lb in enumerate(labels) if lb.startswith(f"{default_src} "))
+                    else:
+                        idx = 1 if labels and labels[0] == custom_label and len(labels) > 1 else 0
+                except Exception:
+                    idx = 1 if labels and labels[0] == custom_label and len(labels) > 1 else 0
+                sel_label = st.selectbox("源表", options=labels, index=idx, key=f"doc_dir_src_{cid or 'new'}")
+                if sel_label == custom_label:
+                    src_table = "custom"
+                    source_entity_type = ""
+                    source_table_value = "custom:"
+                elif sel_label.startswith("entity:"):
+                    src_table = "entity"
+                    source_entity_type = sel_label.split(" ", 1)[0].split("entity:", 1)[1]
+                    source_table_value = f"entity:{source_entity_type}"
+                else:
+                    src_table = sel_label.split(" ")[0]
+                    source_entity_type = ""
+                    source_table_value = src_table
+            else:
+                src_table = st.text_input("源表", value=default_src)
+                source_table_value = src_table
+                source_entity_type = ""
+            if src_table == "custom":
+                custom_default = ""
+                if default_src.startswith("custom:"):
+                    custom_default = default_src.split("custom:", 1)[1]
+                custom_table = st.text_input("自定义源表名", value=custom_default)
+                source_table_value = f"custom:{custom_table}"
+                if custom_table:
+                    if st.session_state.get("source_input_kind") == "db":
+                        try:
+                            from backend.sql_utils import get_source_conn
+                            conn = get_source_conn()
+                            try:
+                                with conn.cursor() as cur:
+                                    cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name=%s LIMIT 1", (custom_table,))
+                                    if not cur.fetchone():
+                                        st.warning("未找到该自定义源表")
+                            finally:
+                                conn.close()
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            from backend.source_fields import detect_sql_path
+                            if not detect_sql_path(custom_table).exists():
+                                st.warning("未找到对应的 SQL 文件")
+                        except Exception:
+                            pass
+            data_filter = st.text_input("数据筛选条件", value=sel_cfg.get("custom_filter") if sel_cfg else "")
+            custom_filter = data_filter
+            src_field = st.text_input("源字段", value=sel_cfg.get("source_field") if sel_cfg else "upload_files")
+            target_entity = st.text_input("目标实体", value=sel_cfg.get("target_entity") if sel_cfg else "")
+            sql_field = st.text_input("sql_field", value=sel_cfg.get("sql_field") if sel_cfg else "id")
+            match_entity_field = st.text_input("匹配的entity_field", value=sel_cfg.get("match_entity_field") if sel_cfg else "id")
+            target_filter = st.text_input("目标实体筛选条件（uuid 或 data.xxx）", value=sel_cfg.get("target_filter") if sel_cfg else "")
+            if src_table == "entity":
+                st.info(f"当前源表为 entity:{source_entity_type}，将从实体数据中读取源字段（如 fjsc），并按实体 uuid 入库。")
+        with col2:
+            parent_uid = st.text_input("父级 UID", value=sel_cfg.get("parent_uid") if sel_cfg else "")
+            dir_template = st.text_area("目录层级模板", value=sel_cfg.get("dir_template") if sel_cfg else "sql.name+'-'+date(%Y-%m-%d,sql.fund_expire_time)/")
+            file_filter = st.text_input("文件过滤正则", value=sel_cfg.get("file_filter") if sel_cfg else "")
+            write_search = st.checkbox("写入 search", value=bool((sel_cfg.get("write_search", 1) if sel_cfg else 1)))
+            remark = st.text_input("备注", value=sel_cfg.get("remark") if sel_cfg else "")
+
+        test_record_id = st.text_input("测试记录ID (选填，仅用于预览)", value="")
+        if src_table == "entity":
+            st.caption(f"entity 模式下可填写实体 uuid 或 data.{match_entity_field} 的值")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            submitted = st.form_submit_button("保存配置")
+        with c2:
+            preview_btn = st.form_submit_button("预览生成结果")
+        with c3:
+            exec_btn = st.form_submit_button("执行入库")
+
+        if submitted:
+            if not name_val or not src_table:
+                st.error("配置名称和源表不能为空")
+            elif src_table == "custom" and not source_table_value.split("custom:", 1)[1]:
+                st.error("请填写自定义源表名")
+            else:
+                new_id = save_doc_dir_cfg({
+                    "id": cid,
+                    "name": name_val,
+                    "source_table": source_table_value,
+                    "source_field": src_field,
+                    "target_entity": target_entity,
+                    "parent_uid": parent_uid,
+                    "dir_template": dir_template,
+                    "file_filter": file_filter,
+                    "remark": remark,
+                    "sql_field": sql_field,
+                    "match_entity_field": match_entity_field,
+                    "custom_filter": custom_filter,
+                    "target_filter": target_filter,
+                    "write_search": write_search
+                })
+                st.success(f"保存成功! ID: {new_id}")
+                st.rerun()
+
+        if preview_btn:
+            if not test_record_id:
+                st.warning("请输入测试记录ID进行预览")
+            else:
+                if src_table == "entity":
+                    row = _fetch_entity_record(source_entity_type, test_record_id)
+                    if row and custom_filter and not _row_match_filter(row, custom_filter):
+                        row = None
+                elif src_table == "custom":
+                    custom_table = source_table_value.split("custom:", 1)[1]
+                    row = _fetch_custom_record(custom_table, test_record_id, custom_filter)
+                else:
+                    if custom_filter and st.session_state.get("source_input_kind") != "db":
+                        row = _fetch_sql_file_record(src_table, test_record_id, custom_filter)
+                    elif custom_filter:
+                        row = _fetch_custom_record(src_table, test_record_id, custom_filter)
+                    else:
+                        row = _fetch_record(src_table, test_record_id)
+                if not row:
+                    st.error("未找到对应记录")
+                else:
+                    st.write("原始记录", row)
+                    rendered_dir = _render_dir_template(dir_template, row)
+                    st.write("生成目录路径", rendered_dir)
+                    files_raw = row.get(src_field, "")
+                    items = _extract_files(files_raw) if src_table == "entity" else _split_files(files_raw)
+                    if file_filter:
+                        try:
+                            pat = re.compile(file_filter)
+                            passed = [x for x in items if pat.search(x.get("name") or x.get("raw") or "")]
+                            skipped = [x for x in items if x not in passed]
+                            st.write("匹配通过", passed)
+                            st.write("未匹配跳过", skipped)
+                        except Exception as e:
+                            st.error(f"正则错误: {e}")
+                    else:
+                        st.write("文件列表", items)
+                    found_files = []
+                    for it in items:
+                        url = it.get("url") or ""
+                        src_path = _resolve_source_file(url)
+                        if src_path and src_path.exists():
+                            found_files.append({"name": it.get("name") or "unnamed", "url": url, "path": str(src_path)})
+                    st.write("本地可找到的文件", found_files)
+                if src_table == "entity":
+                    if target_entity and source_entity_type and source_entity_type != target_entity:
+                        match_val = _get_by_path(row, sql_field)
+                        ent_uuid = _find_entity_uuid(target_entity, match_entity_field, match_val)
+                    else:
+                        match_val = _get_by_path(row, sql_field)
+                        ent_uuid = row.get("uuid")
+                else:
+                    match_val = _get_by_path(row, sql_field)
+                    ent_uuid = _find_entity_uuid(target_entity, match_entity_field, match_val)
+                diag = {
+                    "target_entity": target_entity,
+                    "sql_field": sql_field,
+                    "match_val": match_val,
+                    "match_entity_field": match_entity_field,
+                    "resolved_eid": ent_uuid,
+                    "target_filter": target_filter,
+                }
+                if ent_uuid:
+                    ent_row = _fetch_entity_by_uuid(ent_uuid)
+                    if ent_row:
+                        diag["target_data"] = {
+                            "uuid": ent_row.get("uuid"),
+                            "id": ent_row.get("id"),
+                            "h709j6b8": ent_row.get("h709j6b8")
+                        }
+                        diag["target_filter_match"] = _match_target_entity(ent_uuid, target_filter)
+                st.write("目标实体匹配诊断", diag)
+
+                rows_for_preview = [row]
+                folder_rows, file_rows, search_rows = _build_archive_rows(rows_for_preview, parent_uid, src_table, source_entity_type, False, write_search=write_search)
+                st.write("即将写入 file（文件夹）", folder_rows)
+                st.write("即将写入 file（文件）", file_rows)
+                if write_search:
+                    st.write("即将写入 search", search_rows)
+                else:
+                    st.info("当前配置已关闭 search 写入，本次仅写入 file。")
+
+        if exec_btn:
+            if not src_table or not target_entity:
+                st.warning("请填写源表和目标实体")
+            else:
+                if test_record_id:
+                    rows = []
+                    if src_table == "entity":
+                        r = _fetch_entity_record(source_entity_type, test_record_id)
+                        if r and custom_filter and not _row_match_filter(r, custom_filter):
+                            r = None
+                    elif src_table == "custom":
+                        custom_table = source_table_value.split("custom:", 1)[1]
+                        r = _fetch_custom_record(custom_table, test_record_id, custom_filter)
+                    else:
+                        if custom_filter and st.session_state.get("source_input_kind") != "db":
+                            r = _fetch_sql_file_record(src_table, test_record_id, custom_filter)
+                        elif custom_filter:
+                            r = _fetch_custom_record(src_table, test_record_id, custom_filter)
+                        else:
+                            r = _fetch_record(src_table, test_record_id)
+                    if r:
+                        rows = [r]
+                else:
+                    if src_table == "entity":
+                        rows = _read_entity_rows(source_entity_type)
+                        if custom_filter:
+                            rows = [r for r in rows if _row_match_filter(r, custom_filter)]
+                    elif src_table == "custom":
+                        custom_table = source_table_value.split("custom:", 1)[1]
+                        rows = _read_custom_rows(custom_table, custom_filter)
+                    elif custom_filter:
+                        rows = _read_custom_rows(src_table, custom_filter)
+                    elif st.session_state.get("source_input_kind") == "db":
+                        try:
+                            from backend.sql_utils import get_source_conn
+                            conn = get_source_conn()
+                            try:
+                                with conn.cursor() as cur:
+                                    cur.execute(f"SELECT * FROM {src_table}")
+                                    fetched = cur.fetchall() or []
+                                    cols = [d[0] for d in (cur.description or [])]
+                                if fetched and isinstance(fetched[0], dict):
+                                    rows = list(fetched)
+                                elif cols:
+                                    rows = [dict(zip(cols, row)) for row in fetched]
+                                else:
+                                    rows = []
+                            finally:
+                                conn.close()
+                        except Exception:
+                            rows = []
+                    else:
+                        rows = _parse_all_inserts(src_table)
+                if not rows:
+                    st.warning("未找到可写入记录")
+                else:
+                    prog = st.progress(0)
+                    prog_txt = st.empty()
+                    prog_txt.write("开始构建归档写入数据…")
+                    def _cb(i, total):
+                        if total and total > 0:
+                            pct = int((i / total) * 80)
+                            prog.progress(min(80, max(0, pct)))
+                            prog_txt.write(f"构建归档写入数据：{i}/{total}")
+                    folder_rows, file_rows, search_rows = _build_archive_rows(rows, parent_uid, src_table, source_entity_type, True, write_search=write_search, progress_cb=_cb)
+                    prog.progress(85)
+                    prog_txt.write("写入 file 表…")
+                    n1 = _insert_rows("file", folder_rows + file_rows)
+                    if write_search and search_rows:
+                        prog.progress(95)
+                        prog_txt.write("写入 search 表…")
+                        n2 = _insert_rows("search", search_rows)
+                    else:
+                        prog.progress(100)
+                        prog_txt.write("已跳过 search 写入")
+                        n2 = 0
+                    prog.progress(100)
+                    prog_txt.write("写入完成")
+                    st.success(f"写入完成：file {n1} 条，search {n2} 条")
+
+    if sel_cfg:
+        if st.button("删除当前配置", key=f"del_doc_dir_{cid}"):
+            delete_doc_dir_cfg(cid)
+            st.success("删除成功")
+            st.rerun()
+
 def render_file_mgmt():
     st.title("📃 文件管理")
     render_top_tabs('file')
@@ -3547,19 +4645,489 @@ def render_file_mgmt():
         match_entity_field = st.text_input("匹配的entity_field", value="id")
     with match_cols[1]:
         st.caption("匹配规则：entity.data[匹配的entity_field] == 记录[sql_field]")
-    mode = st.radio("写入模式", options=["数据字段", "文档目录"], index=0, horizontal=True)
-    ef_col = st.columns([2,2])
-    if mode == "数据字段":
-        with ef_col[0]:
-            entity_field = st.text_input("entity_field", value="fjsc")
-        doc_uuid = ""
-        doc_name = ""
-    else:
-        with ef_col[0]:
-            doc_uuid = st.text_input("doc_uuid", value="")
-        with ef_col[1]:
-            doc_name = st.text_input("doc_name", value="")
-        entity_field = ""
+    def _parse_files(val: str):
+        items = []
+        for part in [x.strip() for x in str(val or "").split(",") if x.strip()]:
+            raw_name, raw_url = (part.split("@", 1) + [""])[:2]
+            url = raw_url.strip()
+            fname = ""
+            if url:
+                tail = url.rsplit("/", 1)[-1].strip()
+                fname = raw_name.strip() if raw_name.strip() else tail
+            if not fname:
+                fname = raw_name.strip() or "unnamed"
+            if "." in fname:
+                base = ".".join(fname.split(".")[:-1])
+                ext = fname.split(".")[-1]
+            else:
+                base, ext = fname, ""
+                if "." in url.rsplit("/", 1)[-1]:
+                    possible_ext = url.rsplit("/", 1)[-1].split(".")[-1]
+                    if possible_ext and len(possible_ext) < 6:
+                        ext = possible_ext
+            m = re.search(r"/defaultFile/(\d{8})/([^/]+)/", url)
+            ymd = (m.group(1) if m else "")
+            token = (m.group(2) if m else "")
+            yyyymm = (ymd[:6] if ymd else time.strftime("%Y%m"))
+            items.append({"name": base, "url": url, "yyyymm": yyyymm, "ext": ext, "yyyymmdd": ymd, "token": token})
+        return items
+
+    def _get_upload_root():
+        try:
+            v = st.session_state.get("upload_root")
+            if v:
+                return str(v).strip()
+        except Exception:
+            pass
+        try:
+            from pathlib import Path
+            txt = Path("outer_packet/config_data.json").read_text(encoding="utf-8")
+            cfg = json.loads(txt) if txt else {}
+            if isinstance(cfg, dict):
+                v = cfg.get("upload_root") or ""
+                if v:
+                    return str(v).strip()
+        except Exception:
+            pass
+        return "/Users/songyihong/PEPM/lpp/upload/files"
+
+    def _build_file_row(eid: str, it: Dict[str, Any], fuid: str, entity_field: str, doc_uuid: str, doc_name: str, mode: str, adaptive: bool = False):
+        if adaptive:
+            rel = f"/upload/{sid}/{fuid}/{fuid}"
+        else:
+            rel = f"../upload/files/{sid}/{it['yyyymm']}/{fuid}/{fuid}"
+        src_info = it.get("source_info") or {}
+        full_name = it.get("name","") + (f".{it.get('ext','')}" if it.get("ext") else "")
+        data = json.dumps({
+            "path": None,
+            "source_id": src_info.get("id"),
+            "source_url": src_info.get("url"),
+            "source_path": src_info.get("path"),
+            "name": full_name
+        }, ensure_ascii=False)
+        def _resolve_config_uid() -> str:
+            if mode != "文档目录":
+                return "entity" if adaptive else "root"
+            cid = ((doc_uuid or "").strip() or "mahndrn6w7")
+            name = (doc_name or "").strip()
+            if not name:
+                return "root"
+            uid_val = "root"
+            try:
+                from backend.sql_utils import get_conn
+                conn = get_conn()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT data FROM entity WHERE uuid=%s LIMIT 1", (cid,))
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            try:
+                                cfg = json.loads(row[0])
+                            except Exception:
+                                cfg = {}
+                            items = {}
+                            if isinstance(cfg, dict):
+                                items = cfg.get("item") or (cfg.get("data") or {}).get("item") or {}
+                            if isinstance(items, dict):
+                                for key, meta in items.items():
+                                    nm = str((meta or {}).get("name", "")).strip()
+                                    if nm == name:
+                                        uid_val = str((meta or {}).get("key") or (meta or {}).get("id") or key)
+                                        break
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+            return uid_val
+        uid = _resolve_config_uid()
+        cid_val = (None if mode=="数据字段" else ((doc_uuid or "").strip() or "mahndrn6w7"))
+        path = json.dumps({"config": {"cid": cid_val, "uid": uid}, "eid": eid}, ensure_ascii=False)
+        quote = json.dumps({"mod": {eid: ([entity_field] if entity_field else [])}}, ensure_ascii=False) if mode=="数据字段" else ""
+        now_ts = int(time.time())
+        ext = it.get("ext", "")
+        return {
+            "uuid": fuid, "name": it["name"], "file": rel, "doc_type": entity_type,
+            "flag": "", "size": 0, "data": data, "path": path, "quote": quote,
+            "sid": sid, "eid": eid, "type": ext, "uid": uid,
+            "create_people": "root", "create_date": now_ts, "update_people": "root", "update_date": now_ts,
+            "del": 0, "state": 0, "filecrypt": 0, "oss": 0, "privilege": ""
+        }
+
+    def _save_local_file(it: Dict[str, Any], fuid: str, adaptive: bool = False) -> int:
+        try:
+            import shutil
+            from pathlib import Path
+            url = str(it.get("url") or "")
+            if not url:
+                return 0
+            if "defaultFile/" in url:
+                rel = url.split("defaultFile/", 1)[1].strip("/")
+            else:
+                rel = url.strip("/")
+            if adaptive:
+                target_dir = Path(_get_upload_root()).parent / sid / fuid
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target_path = target_dir / fuid
+            else:
+                target_dir = Path(_get_upload_root()) / sid / it["yyyymm"] / fuid
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target_path = target_dir / fuid
+            src_path = Path(_get_upload_root()) / rel
+            try:
+                if src_path.exists():
+                    shutil.copy2(src_path, target_path)
+                else:
+                    try:
+                        from urllib.request import urlopen
+                        with urlopen(url) as resp, open(target_path, "wb") as f:
+                            f.write(resp.read())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                return target_path.stat().st_size
+            except Exception:
+                return 0
+        except Exception:
+            return 0
+
+    def _write_files(files: list):
+        from backend.sql_utils import get_conn
+        conn = get_conn()
+        wrote = 0
+        try:
+            with conn.cursor() as cur:
+                for r in files:
+                    cur.execute(
+                        """
+                        INSERT INTO file (uuid,name,file,doc_type,flag,size,data,path,quote,sid,eid,type,uid,create_people,create_date,update_people,update_date,del,state,filecrypt,oss,privilege)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            r["uuid"], r["name"], r["file"], r["doc_type"], r["flag"], r["size"], r["data"],
+                            r["path"], r["quote"], r["sid"], r["eid"], r["type"], r["uid"], r["create_people"],
+                            r["create_date"], r["update_people"], r["update_date"], r["del"], r["state"], r["filecrypt"],
+                            r["oss"], r["privilege"]
+                        )
+                    )
+                    wrote += 1
+            conn.commit()
+            return wrote
+        except Exception as e:
+            conn.rollback(); st.error(f"写入 file 失败：{e}")
+            return wrote
+        finally:
+            conn.close()
+
+    def _update_entity_files(eid: str, files: list, entity_field: str, mode: str) -> int:
+        from backend.sql_utils import get_conn
+        conn = get_conn()
+        wrote = 0
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT data FROM entity WHERE uuid=%s", (eid,))
+                row = cur.fetchone()
+                data = {}
+                if row and row[0]:
+                    try:
+                        data = json.loads(row[0])
+                    except Exception:
+                        data = {}
+                if mode == "数据字段":
+                    arr = data.get(entity_field, [])
+                    if not isinstance(arr, list):
+                        arr = []
+                    arr.extend([{"name": f.get("name",""), "url": f.get("file",""), "uuid": f.get("uuid","")} for f in files])
+                    data[entity_field] = arr
+                else:
+                    config = data.get("config", {}) if isinstance(data, dict) else {}
+                    if not isinstance(config, dict):
+                        config = {}
+                    auto_archive = config.get("auto_archive", [])
+                    if not isinstance(auto_archive, list):
+                        auto_archive = []
+                    for f in files:
+                        auto_archive.append(f.get("uuid"))
+                    config["auto_archive"] = auto_archive
+                    data["config"] = config
+                cur.execute("UPDATE entity SET data=%s WHERE uuid=%s", (json.dumps(data, ensure_ascii=False), eid))
+                wrote += 1
+            conn.commit()
+            return wrote
+        except Exception as e:
+            conn.rollback(); st.error(f"更新 entity.data 失败：{e}")
+            return wrote
+        finally:
+            conn.close()
+
+    def _delete_entity_files(eid: str):
+        import shutil
+        from pathlib import Path
+        from backend.sql_utils import get_conn
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT uuid,file FROM file WHERE eid=%s", (eid,))
+                rows = cur.fetchall() or []
+                for r in rows:
+                    try:
+                        rel = str(r[1] or "")
+                        parts = rel.split("/")
+                        if len(parts) >= 7 and parts[0] == ".." and parts[1] == "upload" and parts[2] == "files":
+                            sid_v = parts[3]
+                            yyyymm_v = parts[4]
+                            fdir = parts[5]
+                            base = Path(_get_upload_root()) / sid_v / yyyymm_v / fdir
+                            shutil.rmtree(base, ignore_errors=True)
+                        elif len(parts) >= 5 and parts[1] == "upload":
+                            sid_v = parts[2]
+                            fuid_v = parts[3]
+                            base = Path(_get_upload_root()).parent / sid_v / fuid_v
+                            shutil.rmtree(base, ignore_errors=True)
+                    except Exception:
+                        continue
+                cur.execute("DELETE FROM file WHERE eid=%s", (eid,))
+            conn.commit()
+            return len(rows)
+        except Exception as e:
+            conn.rollback(); st.error(f"删除失败：{e}")
+            return 0
+        finally:
+            conn.close()
+
+    def _build_entity_file_map(entity_rows, file_rows):
+        m = {}
+        for r in entity_rows:
+            if not r.get("data"):
+                continue
+            try:
+                data = json.loads(r.get("data") or "{}")
+            except Exception:
+                data = {}
+            mv = str((data or {}).get(match_entity_field, "") or "")
+            if not mv:
+                continue
+            m.setdefault(mv, []).append(r)
+        idx = {}
+        for f in file_rows:
+            mv = str(f.get("match_value") or "")
+            if not mv:
+                continue
+            idx.setdefault(mv, []).append(f)
+        return m, idx
+
+    def _build_auto_file_rows(src_rows):
+        file_rows = []
+        for r in src_rows:
+            mv = str(r.get(sql_field, "") or "")
+            if not mv:
+                continue
+            files = _parse_files(r.get(src_field, ""))
+            if not files:
+                continue
+            for f in files:
+                f["match_value"] = mv
+                f["source_row"] = r
+                file_rows.append(f)
+        return file_rows
+
+    def _render_file_map_mode(mode: str):
+        from backend.db import list_file_map_cfgs
+        ef_col = st.columns([2,2])
+        if mode == "数据字段":
+            with ef_col[0]:
+                entity_field = st.text_input("entity_field", value="fjsc")
+            doc_uuid = ""
+            doc_name = ""
+        else:
+            with ef_col[0]:
+                doc_uuid = st.text_input("doc_uuid", value="")
+            with ef_col[1]:
+                doc_name = st.text_input("doc_name", value="")
+            entity_field = ""
+        cfg_rows = list_file_map_cfgs()
+        if cfg_rows:
+            for r in cfg_rows:
+                if not r.get("status"):
+                    r["status"] = ""
+        st.markdown("---")
+        st.subheader("文件映射配置")
+        cfg_labels = []
+        for r in cfg_rows:
+            mode_here = "文档目录" if r.get("mode") == "doc" else "数据字段"
+            cfg_labels.append(f"[{r['id']}] {r['source_table']} / {r['source_field']} -> {r['entity']} ({mode_here})")
+        sel_cfg_label = st.selectbox("选择配置", options=["(新增)"] + cfg_labels, key=f"file_cfg_sel_{mode}")
+        sel_cfg = None
+        if sel_cfg_label != "(新增)":
+            try:
+                sel_id = int(sel_cfg_label.split("]")[0][1:])
+                sel_cfg = next((r for r in cfg_rows if int(r.get("id")) == sel_id), None)
+            except Exception:
+                sel_cfg = None
+        save_cols = st.columns([1,1,1,1,2])
+        with save_cols[0]:
+            do_save = st.button("保存配置", key=f"file_save_{mode}")
+        with save_cols[1]:
+            do_preview = st.button("预览匹配", key=f"file_preview_{mode}")
+        with save_cols[2]:
+            do_write = st.button("执行写入", key=f"file_write_{mode}")
+        with save_cols[3]:
+            do_del = st.button("执行删除", key=f"file_del_{mode}")
+        with save_cols[4]:
+            do_rm_cfg = st.button("删除配置", key=f"file_rm_cfg_{mode}")
+        if do_save:
+            status = "已保存"
+            mode_val = ("doc" if mode == "文档目录" else "data")
+            cfg = {
+                "source_table": src_table,
+                "source_field": src_field,
+                "entity": entity_type,
+                "mode": mode_val,
+                "entity_field": entity_field,
+                "doc_uuid": doc_uuid,
+                "doc_name": doc_name,
+                "sql_field": sql_field,
+                "match_entity_field": match_entity_field,
+                "saved_at": int(time.time()),
+                "status": status,
+            }
+            from backend.db import upsert_file_map_cfg
+            rid = upsert_file_map_cfg(cfg)
+            st.success(f"配置已保存（ID={rid}）")
+            st.rerun()
+        if do_preview:
+            if not src_table or not src_field:
+                st.warning("请输入 source_table 和 source_field")
+            else:
+                rows = _parse_all_inserts(src_table)
+                if not rows:
+                    st.warning("未找到 source_table 数据")
+                else:
+                    matched = []
+                    for r in rows:
+                        files = _parse_files(r.get(src_field, ""))
+                        if not files:
+                            continue
+                        for f in files:
+                            f["source_row"] = r
+                            matched.append(f)
+                    st.info(f"找到文件 {len(matched)} 条")
+                    st.dataframe(matched[:200], use_container_width=True)
+        if do_write:
+            if not src_table or not src_field:
+                st.warning("请输入 source_table 和 source_field")
+            else:
+                rows = _parse_all_inserts(src_table)
+                if not rows:
+                    st.warning("未找到 source_table 数据")
+                else:
+                    files = _build_auto_file_rows(rows)
+                    if not files:
+                        st.warning("未找到文件")
+                    else:
+                        ents = _read_sql_rows(entity_type)
+                        emap, idx = _build_entity_file_map(ents, files)
+                        view = []
+                        for mv, e_rows in emap.items():
+                            for e in e_rows:
+                                view.append({"match_value": mv, "entity": e})
+                        if not view:
+                            st.warning("未找到 entity.data 匹配记录")
+                        else:
+                            all_files = []
+                            files_by_eid = {}
+                            for x in view:
+                                e = x.get("entity")
+                                mv = x.get("match_value")
+                                for it in idx.get(mv, []):
+                                    fuid = gen_uuid10()
+                                    size = _save_local_file(it, fuid, adaptive=False)
+                                    row = _build_file_row(e["uuid"], it, fuid, entity_field, doc_uuid, doc_name, mode, adaptive=False)
+                                    row["size"] = size
+                                    all_files.append(row)
+                                    files_by_eid.setdefault(e["uuid"], []).append(row)
+                            if not all_files:
+                                st.info("无可写入文件")
+                            else:
+                                n1 = _write_files(all_files)
+                                n2 = 0
+                                for eid, files in files_by_eid.items():
+                                    n2 += _update_entity_files(eid, files, entity_field, mode)
+                                from backend.db import update_file_map_status
+                                update_file_map_status(sel_cfg.get("id"), f"已入库({n1})")
+                                st.success(f"完成：写入 file {n1} 条，更新 entity {n2} 条")
+        if do_write and mode == "文档目录":
+            adaptive = st.checkbox("适配 JAVA 目录", value=True, key="java_dir_adapt")
+            if adaptive:
+                rows = _parse_all_inserts(src_table)
+                if not rows:
+                    st.warning("未找到 source_table 数据")
+                else:
+                    files = _build_auto_file_rows(rows)
+                    if not files:
+                        st.warning("未找到文件")
+                    else:
+                        ents = _read_sql_rows(entity_type)
+                        emap, idx = _build_entity_file_map(ents, files)
+                        all_files = []
+                        files_by_eid = {}
+                        for e in ents:
+                            try:
+                                data = json.loads(e.get("data") or "{}")
+                            except Exception:
+                                data = {}
+                            mv = str((data or {}).get(match_entity_field, "") or "")
+                            for it in idx.get(mv, []):
+                                fuid = gen_uuid10()
+                                size = _save_local_file(it, fuid, adaptive=True)
+                                row = _build_file_row(e.get("uuid"), it, fuid, entity_field, doc_uuid, doc_name, mode, adaptive=True)
+                                row["size"] = size
+                                all_files.append(row)
+                                files_by_eid.setdefault(e.get("uuid"), []).append(row)
+                        if not all_files:
+                            st.info("无可写入文件")
+                        else:
+                            n1 = _write_files(all_files)
+                            n2_total = 0
+                            for eid, files in files_by_eid.items():
+                                n2_total += _update_entity_files(eid, files, entity_field, mode)
+                            from backend.db import update_file_map_status
+                            update_file_map_status(sel_cfg.get("id"), f"已入库({n1})")
+                            st.success(f"按实体写入（适应JAVA）完成：file {n1} 条，更新 entity {n2_total} 条")
+        if do_del:
+            total = 0
+            for r in view if "view" in locals() else []:
+                key_val = r.get(sql_field, "")
+                e_uuid = fetch_field_uuid(entity_type, match_entity_field, key_val)
+                if not e_uuid:
+                    continue
+                total += _delete_entity_files(e_uuid)
+            if total:
+                st.success(f"已删除 file {total} 条")
+        if do_rm_cfg:
+            from backend.db import delete_file_map_cfg_by_id
+            ok = delete_file_map_cfg_by_id(sel_cfg.get("id") if sel_cfg else 0)
+            if ok:
+                st.success("已删除配置")
+                st.rerun()
+            else:
+                st.info("未找到配置")
+
+    
+    def _render_file_map_mode(mode: str):
+        ef_col = st.columns([2,2])
+        if mode == "数据字段":
+            with ef_col[0]:
+                entity_field = st.text_input("entity_field", value="fjsc")
+            doc_uuid = ""
+            doc_name = ""
+        else:
+            with ef_col[0]:
+                doc_uuid = st.text_input("doc_uuid", value="")
+            with ef_col[1]:
+                doc_name = st.text_input("doc_name", value="")
+            entity_field = ""
     def _parse_files(val: str):
         items = []
         for part in [x.strip() for x in str(val or "").split(",") if x.strip()]:
@@ -4874,6 +6442,19 @@ def render_file_mgmt():
                 conn.close()
 
 
+render_file_mgmt_legacy = render_file_mgmt
+
+def render_file_mgmt():
+    st.title("📃 文件管理")
+    render_top_tabs('file')
+    sid = st.session_state.get("current_sid", SID)
+    st.subheader("文件映射管理")
+    tabs = st.tabs(["文件写入实体(老版)", "文件归档(新版)"])
+    with tabs[0]:
+        render_file_mgmt_legacy()
+    with tabs[1]:
+        render_doc_dir_tab()
+
 def render_user_dept_mgmt():
     st.title("👥 用户部门管理")
     render_top_tabs('user_dept')
@@ -5059,9 +6640,17 @@ def render_user_dept_mgmt():
     if btn_del_preview:
         _preview_delete_usr_by_sys_users()
 
-
 # ================= 入口 =================
 def main():
+    init_db()
+
+    # 读取运行时连接并设置
+    from backend.presets import get_last_runtime
+    from backend.sql_utils import update_runtime_db
+    app_cfg = get_last_runtime()
+    if app_cfg:
+        update_runtime_db(app_cfg.get("kind", "mysql"), app_cfg)
+
     if "page" not in st.session_state:
         st.session_state.page = "list"
         st.session_state.current_table = ""

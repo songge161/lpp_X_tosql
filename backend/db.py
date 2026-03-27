@@ -101,6 +101,46 @@ def init_db():
         );
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS doc_dir_cfgs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            source_table TEXT,
+            source_field TEXT,
+            target_entity TEXT,
+            parent_uid TEXT,
+            dir_template TEXT,
+            file_filter TEXT,
+            remark TEXT,
+            sql_field TEXT,
+            match_entity_field TEXT,
+            custom_filter TEXT,
+            target_filter TEXT,
+            write_search INTEGER DEFAULT 1,
+            saved_at INTEGER
+        );
+        """
+    )
+    try:
+        cur.execute("PRAGMA table_info(doc_dir_cfgs)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "sql_field" not in cols:
+            cur.execute("ALTER TABLE doc_dir_cfgs ADD COLUMN sql_field TEXT")
+        if "match_entity_field" not in cols:
+            cur.execute("ALTER TABLE doc_dir_cfgs ADD COLUMN match_entity_field TEXT")
+        if "custom_filter" not in cols:
+            cur.execute("ALTER TABLE doc_dir_cfgs ADD COLUMN custom_filter TEXT")
+        if "target_filter" not in cols:
+            cur.execute("ALTER TABLE doc_dir_cfgs ADD COLUMN target_filter TEXT")
+        if "write_search" not in cols:
+            cur.execute("ALTER TABLE doc_dir_cfgs ADD COLUMN write_search INTEGER DEFAULT 1")
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
     # --- 访问缓存表 ---
     cur.execute(
         """
@@ -444,6 +484,81 @@ def update_file_map_status(cfg_id: int, status: str) -> None:
     cur.execute("UPDATE file_map_cfgs SET status=? WHERE id=?", (status or "", int(cfg_id)))
     conn.commit()
     conn.close()
+
+# ================= 文档归档配置 (Java) =================
+
+def list_doc_dir_cfgs() -> List[Dict[str, Any]]:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, name, source_table, source_field, target_entity,
+               parent_uid, dir_template, file_filter, remark, sql_field, match_entity_field, custom_filter, target_filter, write_search, saved_at
+        FROM doc_dir_cfgs ORDER BY name ASC
+    """)
+    rows = [
+        {
+            "id": r[0], "name": r[1] or "", "source_table": r[2] or "",
+            "source_field": r[3] or "", "target_entity": r[4] or "",
+            "parent_uid": r[5] or "", "dir_template": r[6] or "",
+            "file_filter": r[7] or "", "remark": r[8] or "",
+            "sql_field": r[9] or "", "match_entity_field": r[10] or "",
+            "custom_filter": r[11] or "", "target_filter": r[12] or "",
+            "write_search": int(r[13] if r[13] is not None else 1),
+            "saved_at": r[14] or 0
+        } for r in cur.fetchall()
+    ]
+    conn.close()
+    return rows
+
+def save_doc_dir_cfg(cfg: Dict[str, Any]) -> int:
+    conn = _conn()
+    cur = conn.cursor()
+    cid = cfg.get("id")
+    now = int(time.time())
+    if cid:
+        cur.execute(
+            """
+            UPDATE doc_dir_cfgs SET
+                name=?, source_table=?, source_field=?, target_entity=?,
+                parent_uid=?, dir_template=?, file_filter=?, remark=?,
+                sql_field=?, match_entity_field=?, custom_filter=?, target_filter=?, write_search=?, saved_at=?
+            WHERE id=?
+            """,
+            (cfg.get("name",""), cfg.get("source_table",""), cfg.get("source_field",""),
+             cfg.get("target_entity",""), cfg.get("parent_uid",""), cfg.get("dir_template",""),
+             cfg.get("file_filter",""), cfg.get("remark",""),
+             cfg.get("sql_field",""), cfg.get("match_entity_field",""),
+             cfg.get("custom_filter",""), cfg.get("target_filter",""),
+             int(1 if cfg.get("write_search", True) else 0), now, cid)
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO doc_dir_cfgs (
+                name, source_table, source_field, target_entity, parent_uid,
+                dir_template, file_filter, remark, sql_field, match_entity_field, custom_filter, target_filter, write_search, saved_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (cfg.get("name",""), cfg.get("source_table",""), cfg.get("source_field",""),
+             cfg.get("target_entity",""), cfg.get("parent_uid",""), cfg.get("dir_template",""),
+             cfg.get("file_filter",""), cfg.get("remark",""),
+             cfg.get("sql_field",""), cfg.get("match_entity_field",""),
+             cfg.get("custom_filter",""), cfg.get("target_filter",""),
+             int(1 if cfg.get("write_search", True) else 0), now)
+        )
+        cid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return cid
+
+def delete_doc_dir_cfg(cid: int) -> bool:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM doc_dir_cfgs WHERE id=?", (cid,))
+    conn.commit()
+    ok = cur.rowcount > 0
+    conn.close()
+    return ok
 
 
 def save_table_mapping(source_table: str, target_entity: str, priority: int = 0, desc: str = ""):
